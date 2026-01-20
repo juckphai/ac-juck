@@ -1,4 +1,3 @@
-
 // ==============================================
 // ตัวแปร global และ Firebase
 // ==============================================
@@ -163,6 +162,266 @@ firebase.auth().onAuthStateChanged(async (user) => {
         loadFromLocal();
     }
 });
+
+// ==============================================
+// ⭐ ฟังก์ชัน เพิ่ม/แก้ไข แบบ Real-time (Transaction) - แก้ไขล่าสุด
+// ==============================================
+
+// ฟังก์ชันตรวจสอบความเท่ากันของข้อมูล (Helper) - เพิ่มใหม่
+function isSameRecord(serverRecord, localRecord) {
+    // 1. ถ้ามี createdTime ให้เทียบเป็นหลัก (แปลงเป็น String ทั้งคู่เพื่อความชัวร์)
+    if (serverRecord.createdTime && localRecord.createdTime) {
+        const sTime = typeof serverRecord.createdTime.toDate === 'function' 
+                      ? serverRecord.createdTime.toDate().toISOString() 
+                      : serverRecord.createdTime.toString();
+        const lTime = typeof localRecord.createdTime.toDate === 'function' 
+                      ? localRecord.createdTime.toDate().toISOString() 
+                      : localRecord.createdTime.toString();
+        
+        // ถ้าเวลาตรงกัน ถือว่าเป็นตัวเดียวกัน
+        if (sTime === lTime) return true;
+    }
+
+    // 2. ถ้าไม่มี createdTime (ข้อมูลเก่า) ให้เทียบเนื้อหา
+    // ต้องแปลง amount เป็น Number และ DateTime เป็น String เพื่อกันพลาดเรื่อง Type
+    return (
+        String(serverRecord.dateTime) === String(localRecord.dateTime) &&
+        String(serverRecord.description).trim() === String(localRecord.description).trim() &&
+        parseFloat(serverRecord.amount) === parseFloat(localRecord.amount) &&
+        String(serverRecord.type) === String(localRecord.type)
+    );
+}
+
+// ฟังก์ชันเพิ่มรายการแบบ Real-time (ปลอดภัยกว่า saveToFirebase)
+async function addTransactionRealtime(newRecord) {
+    if (!currentUser) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    const accDocRef = db.collection('users').doc(`${SHARED_ID}_${newRecord.account}`);
+
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(accDocRef);
+            let serverRecords = [];
+            
+            if (snap.exists) {
+                serverRecords = snap.data().records || [];
+            } else {
+                // กรณีบัญชีใหม่ที่ยังไม่มีไฟล์
+                serverRecords = [];
+            }
+
+            // เพิ่มรายการใหม่ต่อท้าย
+            serverRecords.push(newRecord);
+
+            tx.set(accDocRef, {
+                accountName: newRecord.account,
+                records: serverRecords,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+        console.log(`✅ เพิ่มรายการ Real-time สำเร็จ: ${newRecord.description}`);
+    } catch (err) {
+        console.error("Add Transaction Error:", err);
+        throw err; // ส่ง Error กลับไปให้ addEntry จัดการ
+    }
+}
+
+// ฟังก์ชันแก้ไขรายการแบบ Real-time - แก้ไขใหม่
+async function editTransactionRealtime(oldRecord, newRecord) {
+    if (!currentUser) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    const accDocRef = db.collection('users').doc(`${SHARED_ID}_${newRecord.account}`);
+
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(accDocRef);
+            if (!snap.exists) throw new Error("ไม่พบไฟล์บัญชีบน Server");
+
+            const serverRecords = snap.data().records || [];
+            
+            // ค้นหาตำแหน่งของรายการเดิม โดยใช้ฟังก์ชันช่วย isSameRecord
+            const index = serverRecords.findIndex(r => isSameRecord(r, oldRecord));
+
+            if (index === -1) {
+                console.warn("⚠️ ไม่พบข้อมูลเดิมบน Server (อาจถูกลบไปแล้ว หรือ Type ไม่ตรงกัน) -> ทำการเพิ่มใหม่แทน");
+                // กรณีหาไม่เจอจริงๆ ให้เพิ่มเป็นรายการใหม่ เพื่อกันข้อมูลหาย
+                serverRecords.push(newRecord);
+            } else {
+                console.log(`✓ เจอข้อมูลเดิมที่ตำแหน่ง ${index} -> กำลังอัปเดต...`);
+                // เจอแล้ว! แก้ไขข้อมูลที่ตำแหน่งนั้น
+                serverRecords[index] = newRecord;
+            }
+
+            tx.set(accDocRef, {
+                records: serverRecords,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+        console.log(`✅ แก้ไขรายการ Real-time สำเร็จ: ${newRecord.description}`);
+    } catch (err) {
+        console.error("Edit Transaction Error:", err);
+        throw err;
+    }
+}
+
+// ==============================================
+// ⭐ addEntry() เวอร์ชัน Real-time Transaction - แก้ไขส่วน Edit
+// ==============================================
+async function addEntry() {
+    let entryDateInput = document.getElementById('entryDate').value;
+    let entryTimeInput = document.getElementById('entryTime').value;
+    const typeInput = document.getElementById('type');
+    const typeText = typeInput.value.trim();
+    const description = document.getElementById('description').value;
+    const amount = parseFloat(document.getElementById('amount').value);
+    let datePart, timePart;
+    
+    // ตั้งค่าวันเวลา
+    if (!entryDateInput || !entryTimeInput) {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        datePart = !entryDateInput ? `${y}-${m}-${d}` : entryDateInput;
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        timePart = !entryTimeInput ? `${hh}:${mm}` : entryTimeInput;
+    } else {
+        datePart = entryDateInput;
+        timePart = entryTimeInput;
+    }
+    
+    const dateTime = `${datePart} ${timePart}`;
+    
+    // Validation Checks
+    if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีก่อนเพิ่มรายการ", 'error'); return; }
+    if (!typeText) { showToast("❌ กรุณากรอกประเภท", 'error'); return; }
+    if (!description) { showToast("❌ กรุณากรอกรายละเอียด", 'error'); return; }
+    if (isNaN(amount) || amount <= 0) { showToast("❌ กรุณากรอกจำนวนเงินที่ถูกต้อง", 'error'); return; }
+    
+    initializeAccountTypes(currentAccount);
+    const types = accountTypes.get(currentAccount);
+    let entryCategory = 'expense';
+    if (types["รายรับ"].includes(typeText)) {
+        entryCategory = 'income';
+    }
+
+    const userEmail = getCurrentUserIdentifier();
+    const timestamp = new Date().toISOString();
+    
+    // เก็บรายการที่จะส่งขึ้น Server (เพื่อไม่ให้ UI บล็อกการทำงาน)
+    const transactionPromises = [];
+
+    // --- เริ่มกระบวนการเพิ่ม/แก้ไขข้อมูล ---
+    
+    if (editingIndex !== null) {
+        // === กรณีแก้ไข (Edit) ===
+        // ⚠️ สำคัญ: Clone ข้อมูลเก่าไว้เป๊ะๆ ห้ามแก้ค่าใน originalRecord เด็ดขาด
+        const originalRecord = JSON.parse(JSON.stringify(records[editingIndex]));
+        
+        // สร้าง Object ข้อมูลใหม่
+        const updatedRecord = { 
+            dateTime, 
+            type: typeText, 
+            description, 
+            amount, 
+            account: currentAccount,
+            // คงค่าเดิมที่สำคัญไว้ (สำคัญมากสำหรับการค้นหา)
+            createdBy: originalRecord.createdBy || 'Unknown', 
+            createdTime: originalRecord.createdTime || timestamp, 
+            // อัปเดตข้อมูลผู้แก้ไข
+            editedBy: userEmail,
+            editedTime: timestamp
+        };
+
+        // 1. อัปเดต Local
+        records[editingIndex] = updatedRecord;
+        editingIndex = null;
+        
+        // 2. เตรียมส่งขึ้น Server
+        if (currentUser) {
+            // ส่งทั้งตัวเก่า(ไว้หา) และตัวใหม่(ไว้แทนที่)
+            transactionPromises.push(editTransactionRealtime(originalRecord, updatedRecord));
+        }
+
+        showToast(`✓ แก้ไขข้อมูลเรียบร้อย (กำลังอัปเดต Server...)`, 'info');
+
+    } else {
+        // === กรณีสร้างใหม่ (New) ===
+        const newRecord = { 
+            dateTime, 
+            type: typeText, 
+            description, 
+            amount, 
+            account: currentAccount,
+            createdBy: userEmail,
+            createdTime: timestamp, // สร้าง ID ใหม่
+            editedBy: null,
+            editedTime: null
+        };
+        
+        // 1. อัปเดต Local
+        records.push(newRecord);
+        if (currentUser) {
+            transactionPromises.push(addTransactionRealtime(newRecord));
+        }
+
+        // Multi-account check (เพิ่มหลายบัญชี)
+        const selectedCheckboxes = document.querySelectorAll('#multiAccountCheckboxes input:checked');
+        selectedCheckboxes.forEach(checkbox => {
+            const targetAccount = checkbox.value;
+            const clonedRecord = JSON.parse(JSON.stringify(newRecord));
+            clonedRecord.account = targetAccount; // เปลี่ยนชื่อบัญชี
+            
+            // เพิ่มลง Local
+            records.push(clonedRecord);
+            
+            // เตรียมส่งขึ้น Server
+            if (currentUser) {
+                transactionPromises.push(addTransactionRealtime(clonedRecord));
+            }
+        });
+        
+        showToast(`✓ เพิ่มข้อมูลในเครื่องแล้ว (กำลังส่งขึ้น Server...)`, 'info');
+    }
+    
+    // อัปเดตหน้าจอทันที
+    displayRecords();
+    
+    // เคลียร์ค่า Input
+    document.getElementById('description').value = '';
+    document.getElementById('amount').value = '';
+    setCurrentDateTime();
+    typeInput.value = '';
+    document.querySelectorAll('#multiAccountCheckboxes input:checked').forEach(checkbox => {
+        checkbox.checked = false;
+    });
+    updateMultiAccountSelector();
+
+    // บันทึก LocalStorage (Backup)
+    saveToLocal(); 
+    
+    // --- จัดการการบันทึกออนไลน์ ---
+    if (currentUser && transactionPromises.length > 0) {
+        try {
+            // รอให้ Transaction ทำงานเสร็จ
+            await Promise.all(transactionPromises);
+            
+            if (entryCategory === 'income') {
+                showToast('✅ ซิงค์รายรับออนไลน์เสร็จสมบูรณ์', 'success');
+            } else {
+                showToast('✅ ซิงค์รายจ่ายออนไลน์เสร็จสมบูรณ์', 'success');
+            }
+        } catch (error) {
+            console.error(error);
+            showToast('❌ ซิงค์ออนไลน์ขัดข้อง (ข้อมูลถูกบันทึกในเครื่องแล้ว)', 'error');
+            // ถ้า Transaction พลาด ให้ลอง saveToFirebase แบบเดิมเป็น Fallback
+            await saveToFirebase();
+        }
+    }
+}
 
 // ==============================================
 // ฟังก์ชันจัดการ Firebase Sync
@@ -766,13 +1025,31 @@ function setupSummaryControlsAndSave() {
     fsSlider.removeEventListener("input", updateFontSize);
     fsSlider.addEventListener("input", updateFontSize);
 
-    // --- Line Height Controls ---
+// --- Line Height Controls ---
     const lhSlider = document.getElementById("summaryLineHeightSlider");
     const lhValueSpan = document.getElementById("summaryLineHeightValue");
 
     function updateLineHeight() {
         const lineHeight = lhSlider.value;
+        
+        // 1. ปรับความสูงบรรทัดของข้อความทั่วไป
         modalBody.style.lineHeight = lineHeight;
+        
+        // 2. [เพิ่มใหม่] ปรับความสูงของแถวตาราง (td, th) โดยการปรับ Padding
+        const tableCells = modalBody.querySelectorAll('th, td');
+        tableCells.forEach(cell => {
+            // สูตร: ฐาน 4px คูณด้วยค่า Slider
+            // เช่น Slider = 1.0 -> padding 4px
+            // Slider = 2.0 -> padding 8px
+            const calcPadding = 4 * lineHeight; 
+            
+            // ปรับเฉพาะบน-ล่าง (ซ้าย-ขวาล็อกไว้ที่ 4px หรือตามต้องการ)
+            cell.style.padding = `${calcPadding}px 4px`;
+            
+            // บังคับ line-height ในตารางให้ตาม Slider ด้วย (เผื่อกรณีข้อความยาวตัดบรรทัด)
+            cell.style.lineHeight = lineHeight; 
+        });
+
         lhValueSpan.textContent = "ความสูงของบรรทัด: " + lineHeight;
     }
     
@@ -1427,127 +1704,6 @@ function deleteRecordsByType(typeToDelete) {
 // ฟังก์ชันจัดการรายการ (ปรับปรุงให้บันทึกไป Firebase ด้วย)
 // ==============================================
 
-// ==============================================
-// แก้ไขฟังก์ชัน addEntry ให้บันทึกออนไลน์ทันที
-// ==============================================
-async function addEntry() {
-    let entryDateInput = document.getElementById('entryDate').value;
-    let entryTimeInput = document.getElementById('entryTime').value;
-    const typeInput = document.getElementById('type');
-    const typeText = typeInput.value.trim();
-    const description = document.getElementById('description').value;
-    const amount = parseFloat(document.getElementById('amount').value);
-    let datePart, timePart;
-    
-    // ตั้งค่าวันเวลา
-    if (!entryDateInput || !entryTimeInput) {
-        const now = new Date();
-        const y = now.getFullYear();
-        const m = String(now.getMonth() + 1).padStart(2, '0');
-        const d = String(now.getDate()).padStart(2, '0');
-        datePart = !entryDateInput ? `${y}-${m}-${d}` : entryDateInput;
-        const hh = String(now.getHours()).padStart(2, '0');
-        const mm = String(now.getMinutes()).padStart(2, '0');
-        timePart = !entryTimeInput ? `${hh}:${mm}` : entryTimeInput;
-    } else {
-        datePart = entryDateInput;
-        timePart = entryTimeInput;
-    }
-    
-    const dateTime = `${datePart} ${timePart}`;
-    
-    // Validation Checks
-    if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีก่อนเพิ่มรายการ", 'error'); return; }
-    if (!typeText) { showToast("❌ กรุณากรอกประเภท", 'error'); return; }
-    if (!description) { showToast("❌ กรุณากรอกรายละเอียด", 'error'); return; }
-    if (isNaN(amount) || amount <= 0) { showToast("❌ กรุณากรอกจำนวนเงินที่ถูกต้อง", 'error'); return; }
-    
-    initializeAccountTypes(currentAccount);
-    const types = accountTypes.get(currentAccount);
-    let entryCategory = 'expense';
-    if (types["รายรับ"].includes(typeText)) {
-        entryCategory = 'income';
-    }
-
-    const userEmail = getCurrentUserIdentifier();
-    const timestamp = new Date().toISOString();
-    
-    // --- เริ่มกระบวนการเพิ่ม/แก้ไขข้อมูล ---
-    
-    if (editingIndex !== null) {
-        // === กรณีแก้ไข (Edit) ===
-        const originalRecord = records[editingIndex];
-        records[editingIndex] = { 
-            dateTime, 
-            type: typeText, 
-            description, 
-            amount, 
-            account: currentAccount,
-            createdBy: originalRecord.createdBy || 'Unknown', 
-            createdTime: originalRecord.createdTime || timestamp,
-            editedBy: userEmail,
-            editedTime: timestamp
-        };
-        editingIndex = null;
-        showToast(`✓ แก้ไขข้อมูลในเครื่องเรียบร้อย (กำลังส่งขึ้น Server...)`, 'info');
-    } else {
-        // === กรณีสร้างใหม่ (New) ===
-        const newRecord = { 
-            dateTime, 
-            type: typeText, 
-            description, 
-            amount, 
-            account: currentAccount,
-            createdBy: userEmail,
-            createdTime: timestamp,
-            editedBy: null,
-            editedTime: null
-        };
-        records.push(newRecord);
-
-        // Multi-account check
-        const selectedCheckboxes = document.querySelectorAll('#multiAccountCheckboxes input:checked');
-        selectedCheckboxes.forEach(checkbox => {
-            const targetAccount = checkbox.value;
-            const clonedRecord = JSON.parse(JSON.stringify(newRecord));
-            clonedRecord.account = targetAccount;
-            records.push(clonedRecord);
-        });
-        showToast(`✓ เพิ่มข้อมูลในเครื่องเรียบร้อย (กำลังส่งขึ้น Server...)`, 'info');
-    }
-    
-    // 1. อัปเดตหน้าจอทันทีเพื่อให้รู้ว่ากดแล้ว
-    displayRecords();
-    
-    // 2. เคลียร์ค่า Input
-    document.getElementById('description').value = '';
-    document.getElementById('amount').value = '';
-    setCurrentDateTime();
-    typeInput.value = '';
-    document.querySelectorAll('#multiAccountCheckboxes input:checked').forEach(checkbox => {
-        checkbox.checked = false;
-    });
-    updateMultiAccountSelector();
-
-    // 3. บันทึกข้อมูล (Save)
-    saveToLocal(); // บันทึกเข้าเครื่องก่อน
-    
-    if (currentUser) {
-        try {
-            // บังคับรอให้ Firebase บันทึกเสร็จ
-            await saveToFirebase(); 
-            
-            // แจ้งเตือนเมื่อเสร็จจริง
-            if (entryCategory === 'income') {
-                showToast('✅ บันทึกรายรับออนไลน์เสร็จสมบูรณ์', 'success');
-            } else {
-                showToast('✅ บันทึกรายจ่ายออนไลน์เสร็จสมบูรณ์', 'success');
-            }
-        } catch (error) {
-            showToast('❌ บันทึกออนไลน์ไม่สำเร็จ (แต่ข้อมูลอยู่ในเครื่องแล้ว)', 'error');
-        }
-    }
-}
 function displayRecords() { 
     const recordBody = document.getElementById('recordBody'); 
     
