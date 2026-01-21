@@ -1,7 +1,7 @@
 // service-worker.js
-// ปรับปรุงให้รองรับ Firebase + Offline เต็มรูปแบบ และแก้ปัญหาการเชื่อมต่อ Database
-const staticCacheName = 'account-app-static-v922'; // อัพเดทเวอร์ชัน Cache เป็น v922
-const dynamicCacheName = 'account-app-dynamic-v921';
+// ปรับปรุงเป็น Offline 100% (ลบ Firebase ออกแล้ว)
+const staticCacheName = 'account-app-static-v160'; // อัพเดทเวอร์ชันเป็น v160 เพื่อล้าง cache เก่า
+const dynamicCacheName = 'account-app-dynamic-v160';
 
 // ไฟล์ที่ต้อง cache ตั้งแต่ตอน install
 const assets = [
@@ -16,12 +16,9 @@ const assets = [
   // ไลบรารีภายนอก (เพื่อใช้งาน offline)
   'https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
-  'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
-
-  // ⭐⭐⭐ สำคัญมาก — Firebase SDK ต้อง cache ไม่งั้น offline ใช้ไม่ได้ ⭐⭐⭐
-  'https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js',
-  'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js',
-  'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js',
+  'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'
+  
+  // ❌ ลบ Firebase SDK ออกหมดแล้ว
 ];
 
 // 1) INSTALL — cache ไฟล์ทั้งหมด
@@ -52,14 +49,6 @@ self.addEventListener('activate', evt => {
 // 3) FETCH — cache-first logic + dynamic cache
 self.addEventListener('fetch', evt => {
 
-  // ✅✅✅ ส่วนที่เพิ่มใหม่: ปล่อยผ่าน Firebase/Google API ไม่ให้ Service Worker เข้าไปยุ่ง
-  if (evt.request.url.includes('firestore.googleapis.com') || 
-      evt.request.url.includes('googleapis.com') ||
-      evt.request.url.includes('identitytoolkit')) {
-      return; // ปล่อยให้โหลดสดๆ ผ่าน Network โดยตรง
-  }
-  // ✅✅✅ จบส่วนที่เพิ่มใหม่
-
   // ป้องกัน error จาก chrome-extension หรือ request แปลกๆ
   if (!evt.request.url.startsWith('http')) return;
 
@@ -82,7 +71,7 @@ self.addEventListener('fetch', evt => {
           return networkRes;
         })
         .catch(() => {
-          // ถ้า offline และไม่มี cache → ส่ง index.html แทน
+          // ถ้า offline และไม่มี cache → ส่ง index.html แทน (กรณีเข้าหน้าเว็บครั้งแรกตอนไม่มีเน็ต)
           if (evt.request.destination === 'document') {
             return caches.match('./index.html');
           }

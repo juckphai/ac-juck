@@ -22,6 +22,28 @@
 
 <body>
 
+<div id="login-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #f0f2f5; z-index: 9999; display: flex; justify-content: center; align-items: center; flex-direction: column;">
+    <div style="background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 90%; max-width: 350px; text-align: center;">
+        <h2 style="color: #4a90e2; margin-bottom: 20px;">🔐 เข้าสู่ระบบ</h2>
+        
+        <input type="email" id="loginEmail" placeholder="อีเมลของคุณ" style="width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box;">
+        
+        <div style="position: relative; margin-bottom: 10px;">
+            <input type="password" id="loginPassword" placeholder="รหัสผ่าน" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box;">
+            <span onclick="togglePassword()" style="position: absolute; right: 10px; top: 10px; cursor: pointer;">👁️</span>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; margin-bottom: 20px; font-size: 14px;">
+            <label style="cursor: pointer; display: flex; align-items: center;">
+                <input type="checkbox" id="rememberMe" checked style="margin-right: 5px;"> จำรหัสผ่านไว้
+            </label>
+        </div>
+
+        <button onclick="emailLogin()" style="width: 100%; padding: 10px; background-color: #4a90e2; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer;">เข้าสู่ระบบ</button>
+        <p id="loginError" style="color: red; font-size: 14px; margin-top: 10px;"></p>
+    </div>
+</div>
+
 <div class="container" style="padding:0; border:none; background:none;">
     <div id="install-guide" class="install-prompt">
         <span class="close-prompt" onclick="this.parentElement.style.display='none'">&times;</span>
@@ -39,13 +61,12 @@
 <div style="text-align: center; margin-top: 5px;">
     <div class="container">
         <div style="width: 100%; max-width: 900px; margin: 10px auto;">
-
-            <div id="user-status-bar" style="display:none; background-color: #e3f2fd; color: #0d47a1; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 15px; border: 1px solid #90caf9; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+<div id="user-status-bar" style="display:none; background-color: #e3f2fd; color: #0d47a1; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 15px; border: 1px solid #90caf9; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
                 <span style="font-weight: normal;">👤 ผู้ใช้งานปัจจุบัน:</span> 
                 <span id="current-user-display" style="font-weight: bold; margin-left: 5px;">-</span>
             </div>
-
             <div class="file-actions" style="display: flex; flex-direction: row !important; justify-content: center; align-items: center; gap: 10px; width: 100%; max-width: 900px; margin: 0 auto;">
+              
               <div class="file-button-wrapper" style="width: auto; margin: 0; display: flex;">
                 <input type="file" id="fileInput" onchange="loadFromFile(event)" style="display: none;" accept=".json,application/json,.csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
                 <button type="button" onclick="document.getElementById('fileInput').click()" 
@@ -54,6 +75,12 @@
                   📂 โหลดข้อมูลบัญชี
                 </button>
               </div>
+
+              <button id="btnLogout" onclick="emailLogout()" 
+                      style="display: none; width: auto !important; min-width: auto; height: 50px; padding: 0 20px; font-size: 14px; background-color: #dc3545; color: #FFFFFF; border: 5px solid #FFFFFF; border-radius: 30px; cursor: pointer; white-space: nowrap; box-shadow: 0 2px 5px rgba(0,0,0,0.2); align-items: center; justify-content: center; margin: 0;">
+                  🚪 ออกจากระบบ
+              </button>
+
             </div>
             
             <div style="text-align: center; margin-top: 10px;">
@@ -83,6 +110,9 @@
                     </button>
                     <button type="button" onclick="editAccount()" title="แก้ไขชื่อบัญชี">
                       <span class="button-icon">✏️</span>แก้ไขบช.
+                    </button>
+                    <button type="button" onclick="openChangePasswordModal()" title="เปลี่ยนรหัสผ่านเข้าสู่ระบบ" style="background-color: #ffc107; color: #000;">
+                      <span class="button-icon">🔑</span>เปลี่ยนรหัส
                     </button>
                   </div>
                 </div>
@@ -288,11 +318,11 @@
                       <input type="date" id="endDate">
                     </div>
                   </div>
-                  <div style="text-align: center; margin-top: 8px;">
-                      <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 5px; color: #333;">
-                          <input type="checkbox" id="showDetailsRange"> แสดงรายละเอียดรายการ
-                      </label>
-                  </div>
+<div style="text-align: center; margin-top: 8px;">
+    <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 5px; color: #333;">
+        <input type="checkbox" id="showDetailsRange"> แสดงรายละเอียดรายการ
+    </label>
+</div>
                   <div class="button-container" style="text-align: center; margin-top: 10px;">
                     <button type="button" onclick="summarize()" style="background-color: #009688;">📊 สรุปวันที่ถึงวันที่</button>
                   </div>
@@ -318,7 +348,6 @@
         </table>
     </div>
 </div>
-
 <style>
     footer {
         position: fixed;
@@ -333,6 +362,48 @@
 <footer>
     &copy; 190169 offline-acjuckphai. All Rights Reserved.
 </footer>
+
+<div id="changePasswordModal" class="modal-overlay">
+  <div class="format-modal-content" style="max-width: 400px; width: 90%;">
+    <h3 style="margin-top: 0;">🔑 เปลี่ยนรหัสผ่าน</h3>
+    <p style="font-size: 14px; color: #666; margin-bottom: 20px;">
+      เพื่อความปลอดภัย กรุณายืนยันรหัสผ่านเดิมก่อนตั้งรหัสใหม่
+    </p>
+    
+    <div style="display: flex; flex-direction: column; gap: 15px; margin-bottom: 25px;">
+      
+      <div style="text-align: left;">
+        <label for="oldFirebasePassword" style="display: block; margin-bottom: 5px;">รหัสผ่านเดิม:</label>
+        <div style="position: relative;">
+            <input type="password" id="oldFirebasePassword" placeholder="กรอกรหัสปัจจุบัน" style="width: 100%; padding: 12px; padding-right: 40px; border: 1px solid #ccc; border-radius: 8px;">
+            <span onclick="toggleInputPassword('oldFirebasePassword')" style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; font-size: 18px;">👁️</span>
+        </div>
+      </div>
+
+      <div style="text-align: left;">
+        <label for="newFirebasePassword" style="display: block; margin-bottom: 5px;">ตั้งรหัสผ่านใหม่:</label>
+        <div style="position: relative;">
+            <input type="password" id="newFirebasePassword" placeholder="รหัสใหม่ (ขั้นต่ำ 6 ตัว)" style="width: 100%; padding: 12px; padding-right: 40px; border: 1px solid #ccc; border-radius: 8px;">
+            <span onclick="toggleInputPassword('newFirebasePassword')" style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; font-size: 18px;">👁️</span>
+        </div>
+      </div>
+
+      <div style="text-align: left;">
+        <label for="confirmFirebasePassword" style="display: block; margin-bottom: 5px;">ยืนยันรหัสผ่านใหม่:</label>
+        <div style="position: relative;">
+            <input type="password" id="confirmFirebasePassword" placeholder="พิมพ์อีกครั้ง" style="width: 100%; padding: 12px; padding-right: 40px; border: 1px solid #ccc; border-radius: 8px;">
+            <span onclick="toggleInputPassword('confirmFirebasePassword')" style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; font-size: 18px;">👁️</span>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="format-modal-buttons">
+      <button onclick="handleChangePassword()" style="background-color: #28a745; width: 100%;">💾 ยืนยันการเปลี่ยน</button>
+      <button onclick="closeChangePasswordModal()" class="btn-cancel" style="width: 100%;">❌ ยกเลิก</button>
+    </div>
+  </div>
+</div>
 
 <div id="summaryModal" class="modal-overlay">
   <div class="modal-content-container">
@@ -457,16 +528,18 @@
 <script src="script.js"></script>
 
 <script>
-  // Service Worker Registration (PWA)
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
+      // ใช้ service-worker.js โดยตรง
       navigator.serviceWorker.register('./service-worker.js')
         .then(function(registration) {
           console.log('Service Worker ลงทะเบียนสำเร็จ Scope:', registration.scope);
           
+          // ตรวจสอบการอัปเดต
           registration.addEventListener('updatefound', () => {
             const newWorker = registration.installing;
             console.log('พบ Service Worker ใหม่กำลังติดตั้ง');
+            
             newWorker.addEventListener('statechange', () => {
               if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
                 console.log('พร้อมใช้งาน Service Worker ใหม่ - กรุณารีเฟรชหน้าจอ');
@@ -478,13 +551,14 @@
           console.log('การลงทะเบียน Service Worker ล้มเหลว:', error);
         });
 
+      // ตรวจสอบเมื่อ controller เปลี่ยนแปลง
       navigator.serviceWorker.addEventListener('controllerchange', () => {
         console.log('Service Worker controller เปลี่ยนแปลงแล้ว');
       });
     });
   }
 
-  // PWA Install Prompt Logic
+  // ตรวจจับเมื่อแอปถูกติดตั้ง
   window.addEventListener('appinstalled', (evt) => {
     console.log('แอปพลิเคชันถูกติดตั้งแล้ว');
     const installGuide = document.getElementById('install-guide');
@@ -494,6 +568,7 @@
     localStorage.setItem('pwa_installed', 'true');
   });
 
+  // ตรวจสอบสถานะ PWA
   if (window.matchMedia('(display-mode: standalone)').matches || 
       window.navigator.standalone === true || 
       localStorage.getItem('pwa_installed') === 'true') {
