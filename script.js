@@ -1,5 +1,5 @@
 // ==============================================
-// ตัวแปร global
+// ตัวแปร global และ Firebase
 // ==============================================
 let accounts = [];
 let currentAccount = null;
@@ -12,15 +12,861 @@ let summaryContext = {};
 let singleDateExportContext = {}; 
 let dateRangeExportContext = {};
 
+// Firebase
+let currentUser = null;
+let userDataRef = null;
+let syncInProgress = false;
+let lastSyncTime = null;
+let unsubscribeMain = null;
+let unsubscribeAccount = null;
+let unsubscribeMap = {};
+
+// ==============================================
+// ฟังก์ชันจัดการ Authentication
+// ==============================================
+
 // ==============================================
 // ฟังก์ชันช่วยดึงชื่อผู้ใช้ (Audit Trail Helper)
 // ==============================================
 function getCurrentUserIdentifier() {
-    return 'ผู้ใช้ท้องถิ่น';
+    if (currentUser && currentUser.email) {
+        return currentUser.email;
+    }
+    return 'Guest (Local)'; // กรณีไม่ได้ login หรือเป็น offline
+}
+
+function togglePassword() {
+    const passwordInput = document.getElementById('loginPassword');
+    passwordInput.type = passwordInput.type === 'password' ? 'text' : 'password';
+}
+
+async function emailLogin() {
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPassword').value.trim();
+    const rememberMe = document.getElementById('rememberMe').checked;
+    
+    if (!email || !password) {
+        document.getElementById('loginError').textContent = 'กรุณากรอกอีเมลและรหัสผ่าน';
+        return;
+    }
+    
+    try {
+        showToast('🔐 กำลังเข้าสู่ระบบ...', 'info');
+        
+        const userCredential = await firebase.auth().signInWithEmailAndPassword(email, password);
+        currentUser = userCredential.user;
+        
+        if (rememberMe) {
+            localStorage.setItem('user_email', email);
+        } else {
+            localStorage.removeItem('user_email');
+        }
+        
+        showToast('✅ เข้าสู่ระบบสำเร็จ!', 'success');
+        
+        // ซ่อนหน้า login
+        document.getElementById('login-overlay').style.display = 'none';
+        document.getElementById('btnLogout').style.display = 'flex';
+        
+        // โหลดข้อมูลจาก Firebase
+        await loadFromFirebase();
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        let errorMessage = 'การเข้าสู่ระบบล้มเหลว';
+        
+        switch (error.code) {
+            case 'auth/user-not-found':
+                errorMessage = 'ไม่พบผู้ใช้';
+                break;
+            case 'auth/wrong-password':
+                errorMessage = 'รหัสผ่านไม่ถูกต้อง';
+                break;
+            case 'auth/invalid-email':
+                errorMessage = 'อีเมลไม่ถูกต้อง';
+                break;
+            case 'auth/too-many-requests':
+                errorMessage = 'พยายามเข้าสู่ระบบมากเกินไป โปรดลองใหม่ในภายหลัง';
+                break;
+        }
+        
+        document.getElementById('loginError').textContent = errorMessage;
+        showToast(`❌ ${errorMessage}`, 'error');
+    }
+}
+
+async function emailLogout() {
+    if (confirm('คุณแน่ใจว่าจะออกจากระบบหรือไม่?')) {
+        try {
+            await firebase.auth().signOut();
+            currentUser = null;
+            userDataRef = null;
+            
+            // รีเซ็ตข้อมูล (หรือเก็บข้อมูลไว้ใน localStorage)
+            saveToLocal();
+            
+            // แสดงหน้า login
+            document.getElementById('login-overlay').style.display = 'flex';
+            document.getElementById('btnLogout').style.display = 'none';
+            
+            showToast('✅ ออกจากระบบสำเร็จ', 'success');
+        } catch (error) {
+            console.error('Logout error:', error);
+            showToast('❌ ออกจากระบบล้มเหลว', 'error');
+        }
+    }
+}
+
+// ตรวจสอบสถานะการล็อกอินเมื่อหน้าเว็บโหลด
+firebase.auth().onAuthStateChanged(async (user) => {
+    // อ้างอิง Element ที่เราสร้างใน HTML
+    const userStatusBar = document.getElementById('user-status-bar');
+    const userDisplaySpan = document.getElementById('current-user-display');
+
+    if (user) {
+        currentUser = user;
+        console.log('User is signed in:', user.email);
+        
+        // [เพิ่มส่วนนี้] แสดงชื่อผู้ใช้บนหน้าจอ
+        if (userStatusBar && userDisplaySpan) {
+            userStatusBar.style.display = 'block'; // แสดงแถบ
+            userDisplaySpan.textContent = user.email; // ใส่อีเมล
+        }
+
+        document.getElementById('login-overlay').style.display = 'none';
+        document.getElementById('btnLogout').style.display = 'flex';
+        
+        // โหลดข้อมูลจาก Firebase
+        await loadFromFirebase();
+        
+        // ตั้งค่าอีเมลที่จำไว้
+        const rememberedEmail = localStorage.getItem('user_email');
+        if (rememberedEmail) {
+            document.getElementById('loginEmail').value = rememberedEmail;
+            document.getElementById('rememberMe').checked = true;
+        }
+    } else {
+        console.log('User is signed out');
+        currentUser = null;
+        
+        // [เพิ่มส่วนนี้] ซ่อนแถบชื่อผู้ใช้เมื่อ Logout
+        if (userStatusBar) {
+            userStatusBar.style.display = 'none';
+        }
+
+        // แสดงหน้า login
+        document.getElementById('login-overlay').style.display = 'flex';
+        document.getElementById('btnLogout').style.display = 'none';
+        
+        // โหลดข้อมูลจาก localStorage (สำหรับใช้งานแบบ offline)
+        loadFromLocal();
+    }
+});
+
+// ==============================================
+// ⭐ ฟังก์ชัน เพิ่ม/แก้ไข แบบ Real-time (Transaction) - แก้ไขล่าสุด
+// ==============================================
+
+// ฟังก์ชันตรวจสอบความเท่ากันของข้อมูล (Helper) - เพิ่มใหม่
+function isSameRecord(serverRecord, localRecord) {
+    // 1. ถ้ามี createdTime ให้เทียบเป็นหลัก (แปลงเป็น String ทั้งคู่เพื่อความชัวร์)
+    if (serverRecord.createdTime && localRecord.createdTime) {
+        const sTime = typeof serverRecord.createdTime.toDate === 'function' 
+                      ? serverRecord.createdTime.toDate().toISOString() 
+                      : serverRecord.createdTime.toString();
+        const lTime = typeof localRecord.createdTime.toDate === 'function' 
+                      ? localRecord.createdTime.toDate().toISOString() 
+                      : localRecord.createdTime.toString();
+        
+        // ถ้าเวลาตรงกัน ถือว่าเป็นตัวเดียวกัน
+        if (sTime === lTime) return true;
+    }
+
+    // 2. ถ้าไม่มี createdTime (ข้อมูลเก่า) ให้เทียบเนื้อหา
+    // ต้องแปลง amount เป็น Number และ DateTime เป็น String เพื่อกันพลาดเรื่อง Type
+    return (
+        String(serverRecord.dateTime) === String(localRecord.dateTime) &&
+        String(serverRecord.description).trim() === String(localRecord.description).trim() &&
+        parseFloat(serverRecord.amount) === parseFloat(localRecord.amount) &&
+        String(serverRecord.type) === String(localRecord.type)
+    );
+}
+
+// ฟังก์ชันเพิ่มรายการแบบ Real-time (ปลอดภัยกว่า saveToFirebase)
+async function addTransactionRealtime(newRecord) {
+    if (!currentUser) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    const accDocRef = db.collection('users').doc(`${SHARED_ID}_${newRecord.account}`);
+
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(accDocRef);
+            let serverRecords = [];
+            
+            if (snap.exists) {
+                serverRecords = snap.data().records || [];
+            } else {
+                // กรณีบัญชีใหม่ที่ยังไม่มีไฟล์
+                serverRecords = [];
+            }
+
+            // เพิ่มรายการใหม่ต่อท้าย
+            serverRecords.push(newRecord);
+
+            tx.set(accDocRef, {
+                accountName: newRecord.account,
+                records: serverRecords,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+        console.log(`✅ เพิ่มรายการ Real-time สำเร็จ: ${newRecord.description}`);
+    } catch (err) {
+        console.error("Add Transaction Error:", err);
+        throw err; // ส่ง Error กลับไปให้ addEntry จัดการ
+    }
+}
+
+// ฟังก์ชันแก้ไขรายการแบบ Real-time - แก้ไขใหม่
+async function editTransactionRealtime(oldRecord, newRecord) {
+    if (!currentUser) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    const accDocRef = db.collection('users').doc(`${SHARED_ID}_${newRecord.account}`);
+
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(accDocRef);
+            if (!snap.exists) throw new Error("ไม่พบไฟล์บัญชีบน Server");
+
+            const serverRecords = snap.data().records || [];
+            
+            // ค้นหาตำแหน่งของรายการเดิม โดยใช้ฟังก์ชันช่วย isSameRecord
+            const index = serverRecords.findIndex(r => isSameRecord(r, oldRecord));
+
+            if (index === -1) {
+                console.warn("⚠️ ไม่พบข้อมูลเดิมบน Server (อาจถูกลบไปแล้ว หรือ Type ไม่ตรงกัน) -> ทำการเพิ่มใหม่แทน");
+                // กรณีหาไม่เจอจริงๆ ให้เพิ่มเป็นรายการใหม่ เพื่อกันข้อมูลหาย
+                serverRecords.push(newRecord);
+            } else {
+                console.log(`✓ เจอข้อมูลเดิมที่ตำแหน่ง ${index} -> กำลังอัปเดต...`);
+                // เจอแล้ว! แก้ไขข้อมูลที่ตำแหน่งนั้น
+                serverRecords[index] = newRecord;
+            }
+
+            tx.set(accDocRef, {
+                records: serverRecords,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        });
+        console.log(`✅ แก้ไขรายการ Real-time สำเร็จ: ${newRecord.description}`);
+    } catch (err) {
+        console.error("Edit Transaction Error:", err);
+        throw err;
+    }
 }
 
 // ==============================================
-// ฟังก์ชันจัดการเมนู
+// ⭐ addEntry() เวอร์ชัน Real-time Transaction - แก้ไขส่วน Edit
+// ==============================================
+async function addEntry() {
+    let entryDateInput = document.getElementById('entryDate').value;
+    let entryTimeInput = document.getElementById('entryTime').value;
+    const typeInput = document.getElementById('type');
+    const typeText = typeInput.value.trim();
+    const description = document.getElementById('description').value;
+    const amount = parseFloat(document.getElementById('amount').value);
+    let datePart, timePart;
+    
+    // ตั้งค่าวันเวลา
+    if (!entryDateInput || !entryTimeInput) {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        datePart = !entryDateInput ? `${y}-${m}-${d}` : entryDateInput;
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        timePart = !entryTimeInput ? `${hh}:${mm}` : entryTimeInput;
+    } else {
+        datePart = entryDateInput;
+        timePart = entryTimeInput;
+    }
+    
+    const dateTime = `${datePart} ${timePart}`;
+    
+    // Validation Checks
+    if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีก่อนเพิ่มรายการ", 'error'); return; }
+    if (!typeText) { showToast("❌ กรุณากรอกประเภท", 'error'); return; }
+    if (!description) { showToast("❌ กรุณากรอกรายละเอียด", 'error'); return; }
+    if (isNaN(amount) || amount <= 0) { showToast("❌ กรุณากรอกจำนวนเงินที่ถูกต้อง", 'error'); return; }
+    
+    initializeAccountTypes(currentAccount);
+    const types = accountTypes.get(currentAccount);
+    let entryCategory = 'expense';
+    if (types["รายรับ"].includes(typeText)) {
+        entryCategory = 'income';
+    }
+
+    const userEmail = getCurrentUserIdentifier();
+    const timestamp = new Date().toISOString();
+    
+    // เก็บรายการที่จะส่งขึ้น Server (เพื่อไม่ให้ UI บล็อกการทำงาน)
+    const transactionPromises = [];
+
+    // --- เริ่มกระบวนการเพิ่ม/แก้ไขข้อมูล ---
+    
+    if (editingIndex !== null) {
+        // === กรณีแก้ไข (Edit) ===
+        // ⚠️ สำคัญ: Clone ข้อมูลเก่าไว้เป๊ะๆ ห้ามแก้ค่าใน originalRecord เด็ดขาด
+        const originalRecord = JSON.parse(JSON.stringify(records[editingIndex]));
+        
+        // สร้าง Object ข้อมูลใหม่
+        const updatedRecord = { 
+            dateTime, 
+            type: typeText, 
+            description, 
+            amount, 
+            account: currentAccount,
+            // คงค่าเดิมที่สำคัญไว้ (สำคัญมากสำหรับการค้นหา)
+            createdBy: originalRecord.createdBy || 'Unknown', 
+            createdTime: originalRecord.createdTime || timestamp, 
+            // อัปเดตข้อมูลผู้แก้ไข
+            editedBy: userEmail,
+            editedTime: timestamp
+        };
+
+        // 1. อัปเดต Local
+        records[editingIndex] = updatedRecord;
+        editingIndex = null;
+        
+        // 2. เตรียมส่งขึ้น Server
+        if (currentUser) {
+            // ส่งทั้งตัวเก่า(ไว้หา) และตัวใหม่(ไว้แทนที่)
+            transactionPromises.push(editTransactionRealtime(originalRecord, updatedRecord));
+        }
+
+        showToast(`✓ แก้ไขข้อมูลเรียบร้อย (กำลังอัปเดต Server...)`, 'info');
+
+    } else {
+        // === กรณีสร้างใหม่ (New) ===
+        const newRecord = { 
+            dateTime, 
+            type: typeText, 
+            description, 
+            amount, 
+            account: currentAccount,
+            createdBy: userEmail,
+            createdTime: timestamp, // สร้าง ID ใหม่
+            editedBy: null,
+            editedTime: null
+        };
+        
+        // 1. อัปเดต Local
+        records.push(newRecord);
+        if (currentUser) {
+            transactionPromises.push(addTransactionRealtime(newRecord));
+        }
+
+        // Multi-account check (เพิ่มหลายบัญชี)
+        const selectedCheckboxes = document.querySelectorAll('#multiAccountCheckboxes input:checked');
+        selectedCheckboxes.forEach(checkbox => {
+            const targetAccount = checkbox.value;
+            const clonedRecord = JSON.parse(JSON.stringify(newRecord));
+            clonedRecord.account = targetAccount; // เปลี่ยนชื่อบัญชี
+            
+            // เพิ่มลง Local
+            records.push(clonedRecord);
+            
+            // เตรียมส่งขึ้น Server
+            if (currentUser) {
+                transactionPromises.push(addTransactionRealtime(clonedRecord));
+            }
+        });
+        
+        showToast(`✓ เพิ่มข้อมูลในเครื่องแล้ว (กำลังส่งขึ้น Server...)`, 'info');
+    }
+    
+    // อัปเดตหน้าจอทันที
+    displayRecords();
+    
+    // เคลียร์ค่า Input
+    document.getElementById('description').value = '';
+    document.getElementById('amount').value = '';
+    setCurrentDateTime();
+    typeInput.value = '';
+    document.querySelectorAll('#multiAccountCheckboxes input:checked').forEach(checkbox => {
+        checkbox.checked = false;
+    });
+    updateMultiAccountSelector();
+
+    // บันทึก LocalStorage (Backup)
+    saveToLocal(); 
+    
+    // --- จัดการการบันทึกออนไลน์ ---
+    if (currentUser && transactionPromises.length > 0) {
+        try {
+            // รอให้ Transaction ทำงานเสร็จ
+            await Promise.all(transactionPromises);
+            
+            if (entryCategory === 'income') {
+                showToast('✅ ซิงค์รายรับออนไลน์เสร็จสมบูรณ์', 'success');
+            } else {
+                showToast('✅ ซิงค์รายจ่ายออนไลน์เสร็จสมบูรณ์', 'success');
+            }
+        } catch (error) {
+            console.error(error);
+            showToast('❌ ซิงค์ออนไลน์ขัดข้อง (ข้อมูลถูกบันทึกในเครื่องแล้ว)', 'error');
+            // ถ้า Transaction พลาด ให้ลอง saveToFirebase แบบเดิมเป็น Fallback
+            await saveToFirebase();
+        }
+    }
+}
+
+// ==============================================
+// ฟังก์ชันจัดการ Firebase Sync
+// ==============================================
+
+async function loadFromFirebase() {
+    if (!currentUser) return;
+    
+    try {
+        showToast('☁️ กำลังโหลดข้อมูล (ระบบแยกบัญชี)...', 'info');
+        // ==========================================
+        // 🟢 กำหนด ID กลุ่มหลัก
+        const SHARED_ID = 'my_shared_group_01'; 
+        // ==========================================
+        
+        // 1. โหลดไฟล์หลัก (เก็บรายชื่อบัญชี และการตั้งค่า)
+        const mainDocRef = db.collection('users').doc(SHARED_ID);
+        const mainDoc = await mainDocRef.get();
+        
+        if (mainDoc.exists) {
+            const data = mainDoc.data();
+            accounts = data.accounts || [];
+            currentAccount = data.currentAccount || null;
+            
+            // โหลด accountTypes
+            if (data.accountTypes) {
+                if (Array.isArray(data.accountTypes)) {
+                    accountTypes = new Map(data.accountTypes);
+                } else {
+                    accountTypes = new Map(Object.entries(data.accountTypes));
+                }
+            } else {
+                accountTypes = new Map();
+            }
+            backupPassword = data.backupPassword || null;
+            
+            // ✅ แก้ไขจุดที่ Error: ตรวจสอบประเภทข้อมูลก่อนแปลงวันที่
+            if (data.lastUpdated) {
+                if (typeof data.lastUpdated.toDate === 'function') {
+                    // กรณีเป็น Firestore Timestamp (ปกติ)
+                    lastSyncTime = data.lastUpdated.toDate();
+                } else {
+                    // กรณีเป็น String หรือ Date Object (ข้อมูลเก่า/Import)
+                    lastSyncTime = new Date(data.lastUpdated);
+                }
+            } else {
+                lastSyncTime = new Date();
+            }
+
+            // 2. โหลดรายการ (Records) ของ "ทุกบัญชี" แยกตามไฟล์
+            const loadPromises = accounts.map(async (accName) => {
+                const docId = `${SHARED_ID}_${accName}`;
+                const accDoc = await db.collection('users').doc(docId).get();
+                if (accDoc.exists) {
+                    const accData = accDoc.data();
+                    return accData.records || [];
+                }
+                return [];
+            });
+
+const results = await Promise.all(loadPromises);
+            
+            // --- แก้ไขใหม่: ผสานข้อมูลจาก Server เข้ากับข้อมูล Local (ไม่ทับของที่ทำ Offline) ---
+            const serverRecords = results.flat();
+            
+            // ถ้ามีข้อมูลในเครื่องอยู่แล้ว (ทำ Offline ไว้)
+            if (records.length > 0) {
+                console.log("พบข้อมูล Local, กำลังผสานกับ Server...");
+                serverRecords.forEach(serverRec => {
+                    // เช็คว่ามีรายการนี้อยู่แล้วหรือไม่ (เทียบวันเวลา, ยอดเงิน, รายละเอียด)
+                    const isDuplicate = records.some(localRec => 
+                        localRec.dateTime === serverRec.dateTime &&
+                        localRec.amount === serverRec.amount &&
+                        localRec.description === serverRec.description &&
+                        localRec.account === serverRec.account
+                    );
+                    
+                    // ถ้ายังไม่มีในเครื่อง ให้เติมเข้าไป
+                    if (!isDuplicate) {
+                        records.push(serverRec);
+                    }
+                });
+// ✅✅✅ เติมตรงนี้ครับ: เช็คว่าถ้ามีข้อมูล Offline ผสมอยู่ ให้รีบ Save ขึ้น Cloud ทันที
+                if (records.length > serverRecords.length) {
+                    console.log("💡 พบข้อมูล Offline ที่ยังไม่มีบน Cloud -> กำลัง Auto-Sync...");
+                    await saveToFirebase(); 
+                }
+                // (ส่วนรายการที่ทำ Offline ไว้ ก็จะยังคงอยู่ในตัวแปร records ไม่หายไปไหน)
+            } else {
+                // ถ้าในเครื่องไม่มีอะไรเลย ก็ใช้ของ Server ได้เลย
+                records = serverRecords;
+            }
+            
+            // จัดเรียงข้อมูลใหม่ตามเวลา
+            records.sort((a, b) => parseLocalDateTime(b.dateTime) - parseLocalDateTime(a.dateTime));
+            // -----------------------------------------------------------------------
+            
+            // อัพเดทหน้าจอ
+            updateAccountSelect();
+            
+            if (currentAccount && accounts.includes(currentAccount)) {
+                document.getElementById('accountSelect').value = currentAccount;
+            } else if (accounts.length > 0) {
+                currentAccount = accounts[0]; 
+            } else {
+                currentAccount = null;
+            }
+            
+            changeAccount(); // แสดงผลเบื้องต้น
+            
+            showToast('✅ โหลดข้อมูลทุกบัญชีสำเร็จ!', 'success');
+
+            // =======================================================
+            // 🟢 เพิ่มบรรทัดนี้: สั่งเริ่มระบบดักฟังข้อมูล Real-time ทันทีที่โหลดเสร็จ
+            setupRealtimeListener(); 
+            // =======================================================
+
+        } else {
+            console.log('No main data found in Firebase');
+            showToast('📱 พร้อมใช้งาน (เริ่มต้นใหม่)', 'info');
+            setupRealtimeListener(); 
+        }
+        
+    } catch (error) {
+        console.error('Error loading:', error);
+        showToast('❌ โหลดข้อมูลล้มเหลว ใช้ข้อมูลจากเครื่องแทน', 'error');
+        loadFromLocal();
+    }
+}
+// ฟังก์ชันช่วยเปรียบเทียบว่ารายการเหมือนกันหรือไม่ (ใช้สำหรับ Merge ข้อมูล)
+function isRecordEqual(rec1, rec2) {
+    return rec1.dateTime === rec2.dateTime &&
+           rec1.amount === rec2.amount &&
+           rec1.description === rec2.description &&
+           rec1.type === rec2.type &&
+           rec1.account === rec2.account;
+}
+
+// ==============================================
+// ⭐ saveToFirebase() เวอร์ชัน Real-time 100% (แก้ไขใหม่)
+// ==============================================
+async function saveToFirebase() {
+    if (!currentUser || syncInProgress) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    syncInProgress = true;
+    updateSyncStatus();
+
+    try {
+        // ===== 1. Main Doc (accounts / settings) =====
+        const mainDocRef = db.collection('users').doc(SHARED_ID);
+
+        await mainDocRef.set({
+            accounts: accounts || [],
+            currentAccount: currentAccount || null,
+            accountTypes: Object.fromEntries(accountTypes || []),
+            backupPassword: backupPassword || null,
+            lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+        });
+
+        // ===== 2. Account Docs (records) =====
+        const promises = accounts.map(accName => {
+            const accDocRef = db
+                .collection('users')
+                .doc(`${SHARED_ID}_${accName}`);
+
+            const accRecords = records.filter(r => r.account === accName);
+
+            return accDocRef.set({
+                accountName: accName,
+                records: accRecords,               // 🔥 เขียนใหม่ทั้ง array
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            });
+        });
+
+        await Promise.all(promises);
+
+        lastSyncTime = new Date();
+        showToast('☁️ ซิงค์ข้อมูลเรียบร้อย (Real-time)', 'success');
+
+    } catch (err) {
+        console.error(err);
+        showToast(`❌ Sync ล้มเหลว: ${err.message}`, 'error');
+    } finally {
+        syncInProgress = false;
+        updateSyncStatus();
+    }
+}
+
+function setupRealtimeListener() {
+    if (!currentUser) return;
+    
+    // ==========================================
+    const SHARED_ID = 'my_shared_group_01';
+    // ==========================================
+
+    console.log('📡 กำลังเริ่มระบบดักฟังข้อมูล Real-time (Multi-account mode)...');
+
+    // 1. จัดการ Main Listener (รายชื่อบัญชี)
+    // ถ้าเคยดักฟังอยู่แล้ว ให้ยกเลิกก่อนกันซ้ำ
+    if (unsubscribeMain) {
+        unsubscribeMain();
+        unsubscribeMain = null;
+    }
+
+    const mainDocRef = db.collection('users').doc(SHARED_ID);
+    unsubscribeMain = mainDocRef.onSnapshot((doc) => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        
+        // ตรวจสอบว่ามีบัญชีเพิ่ม/ลด หรือไม่
+        const newAccountsList = data.accounts || [];
+        const isAccountListChanged = JSON.stringify(accounts) !== JSON.stringify(newAccountsList);
+
+        if (isAccountListChanged) {
+            console.log('📋 พบการเปลี่ยนแปลงรายชื่อบัญชี ปรับปรุงข้อมูล...');
+            accounts = newAccountsList;
+            updateAccountSelect();
+            updateMultiAccountSelector();
+            updateImportAccountSelect();
+            
+            // ถ้าบัญชีเปลี่ยน ต้องเรียก setupRealtimeListener ใหม่เพื่อไปดักฟังบัญชีที่งอกมาใหม่
+            // หรือยกเลิกบัญชีที่หายไป
+            setupAccountListeners(SHARED_ID);
+        }
+        
+        // อัปเดต accountTypes
+        if (data.accountTypes) {
+             if (Array.isArray(data.accountTypes)) {
+                accountTypes = new Map(data.accountTypes);
+             } else {
+                accountTypes = new Map(Object.entries(data.accountTypes));
+             }
+        }
+    }, (error) => {
+        console.error("Main listener error:", error);
+    });
+
+    // 2. เริ่มดักฟังข้อมูลธุรกรรมของทุกบัญชี
+    setupAccountListeners(SHARED_ID);
+}
+
+// ฟังก์ชันย่อยสำหรับจัดการ Loop ดักฟังบัญชี
+function setupAccountListeners(SHARED_ID) {
+    // A. วนลูปสร้าง Listener ให้ครบทุกบัญชีที่มี
+    accounts.forEach(accName => {
+        // ถ้าบัญชีนี้ยังไม่มี Listener ให้สร้างใหม่
+        if (!unsubscribeMap[accName]) {
+            const accDocId = `${SHARED_ID}_${accName}`;
+            console.log(`➕ เริ่มดักฟังบัญชี: ${accName}`);
+            
+            unsubscribeMap[accName] = db.collection('users').doc(accDocId)
+                .onSnapshot((doc) => {
+                    if (!doc.exists) return;
+                    const data = doc.data();
+                    const serverRecords = data.records || [];
+                    
+                    // --- หัวใจสำคัญ: อัปเดต Array records กลาง ---
+                    
+                    // 1. ลบข้อมูลเก่าของบัญชีนี้ออกจาก Memory ให้หมด
+                    records = records.filter(r => r.account !== accName);
+                    
+                    // 2. เติมข้อมูลใหม่ที่ได้จาก Server เข้าไป
+                    // (ทำแบบนี้ข้อมูลจะ Sync เป๊ะๆ ตาม Server เสมอ)
+                    records = records.concat(serverRecords);
+                    
+                    // 3. จัดเรียงข้อมูลตามเวลาใหม่ (เพราะข้อมูลใหม่พึ่งต่อท้ายมา)
+                    records.sort((a, b) => parseLocalDateTime(b.dateTime) - parseLocalDateTime(a.dateTime));
+                    
+                    // 4. อัปเดต Last Sync Time เพื่อโชว์สถานะ
+                    if (data.lastUpdated) {
+                        let remoteTime;
+                        if (typeof data.lastUpdated.toDate === 'function') {
+                            remoteTime = data.lastUpdated.toDate();
+                        } else {
+                            remoteTime = new Date(data.lastUpdated);
+                        }
+                        if (!lastSyncTime || remoteTime > lastSyncTime) {
+                            lastSyncTime = remoteTime;
+                        }
+                    }
+                    updateSyncStatus();
+
+                    // 5. ถ้าบัญชีที่มีการอัปเดต เป็นบัญชีที่เราเปิดดูอยู่ -> รีเฟรชหน้าจอทันที
+                    if (currentAccount === accName) {
+                        console.log(`🔄 บัญชีที่เปิดอยู่ (${accName}) มีการเปลี่ยนแปลง รีเฟรชตาราง...`);
+                        displayRecords();
+                    } else {
+                         console.log(`☁️ บัญชี ${accName} อัปเดตเบื้องหลังเรียบร้อย`);
+                    }
+
+                }, (error) => {
+                    console.error(`Error listening to ${accName}:`, error);
+                });
+        }
+    });
+
+    // B. Cleanup: ยกเลิก Listener ของบัญชีที่ถูกลบทิ้งไปแล้ว
+    Object.keys(unsubscribeMap).forEach(accName => {
+        if (!accounts.includes(accName)) {
+            console.log(`🛑 ยกเลิกการดักฟังบัญชีที่ถูกลบ: ${accName}`);
+            if (unsubscribeMap[accName]) {
+                unsubscribeMap[accName](); // สั่งหยุดฟัง Firebase
+                delete unsubscribeMap[accName]; // ลบออกจาก Map
+            }
+            // ลบข้อมูลของบัญชีนี้ออกจาก Memory ด้วย
+            records = records.filter(r => r.account !== accName);
+            displayRecords();
+        }
+    });
+}
+
+// ==============================================
+// ⭐ deleteRecordRealtime() ฟังก์ชันลบแบบ Real-time
+// ==============================================
+async function deleteRecordRealtime(record) {
+    if (!currentUser) return;
+
+    const SHARED_ID = 'my_shared_group_01';
+    const accDocRef = db
+        .collection('users')
+        .doc(`${SHARED_ID}_${record.account}`);
+
+    try {
+        await db.runTransaction(async (tx) => {
+            const snap = await tx.get(accDocRef);
+            if (!snap.exists) return;
+
+            const serverRecords = snap.data().records || [];
+
+            const filtered = serverRecords.filter(r =>
+                !(
+                    r.dateTime === record.dateTime &&
+                    r.amount === record.amount &&
+                    r.description === record.description &&
+                    r.type === record.type
+                )
+            );
+
+            tx.set(accDocRef, {
+                records: filtered,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+            });
+        });
+
+        showToast('🗑️ ลบข้อมูลแบบ Real-time สำเร็จ', 'success');
+
+    } catch (err) {
+        console.error(err);
+        showToast('❌ ลบข้อมูลไม่สำเร็จ', 'error');
+    }
+}
+
+function updateSyncStatus() {
+    const syncStatus = document.getElementById('sync-status');
+    if (!syncStatus) return;
+    
+    let statusText = '';
+    let statusColor = '';
+    
+    if (!currentUser) {
+        statusText = '📴 ออฟไลน์ (ไม่ได้ล็อกอิน)';
+        statusColor = '#888';
+    } else if (syncInProgress) {
+        statusText = '🔄 กำลังซิงค์ข้อมูล...';
+        statusColor = '#ff9800';
+    } else if (lastSyncTime) {
+        const timeAgo = getTimeAgo(lastSyncTime);
+        statusText = `☁️ ซิงค์ล่าสุด: ${timeAgo}`;
+        statusColor = '#4CAF50';
+    } else {
+        statusText = '☁️ พร้อมซิงค์';
+        statusColor = '#4CAF50';
+    }
+    
+    syncStatus.textContent = statusText;
+    syncStatus.style.color = statusColor;
+}
+
+function getTimeAgo(date) {
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+    
+    if (diffMins < 1) return 'ไม่กี่วินาทีที่แล้ว';
+    if (diffMins < 60) return `${diffMins} นาทีที่แล้ว`;
+    if (diffHours < 24) return `${diffHours} ชั่วโมงที่แล้ว`;
+    if (diffDays === 1) return 'เมื่อวานนี้';
+    if (diffDays < 7) return `${diffDays} วันที่แล้ว`;
+    
+    return date.toLocaleDateString('th-TH', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric'
+    });
+}
+
+// ==============================================
+// ฟังก์ชันจัดการ Toast Notification
+// ==============================================
+
+function showToast(message, type = 'info') {
+    const toast = document.getElementById('toast');
+    
+    // กำหนดสีตามประเภท
+    let backgroundColor = '#007bff'; // เริ่มต้นสีน้ำเงิน
+    switch(type) {
+        case 'success':
+            backgroundColor = '#28a745'; // สีเขียว
+            break;
+        case 'error':
+            backgroundColor = '#dc3545'; // สีแดง
+            break;
+        case 'warning':
+            backgroundColor = '#ffc107'; // สีเหลือง
+            break;
+        case 'income':
+            backgroundColor = '#28a745'; // สีเขียวสำหรับรายรับ
+            break;
+        case 'expense':
+            backgroundColor = '#dc3545'; // สีแดงสำหรับรายจ่าย
+            break;
+        case 'info':
+        default:
+            backgroundColor = '#007bff'; // สีน้ำเงิน
+            break;
+    }
+    
+    // ตั้งค่าข้อความและสี
+    toast.textContent = message;
+    toast.style.backgroundColor = backgroundColor;
+    
+    // แสดง toast
+    toast.className = "toast-notification show";
+    
+    // ซ่อน toast หลังจาก 3 วินาที
+    setTimeout(function() {
+        toast.className = toast.className.replace("show", "");
+    }, 3000);
+}
+
+// ==============================================
+// ฟังก์ชันจัดการเมนู (คงเดิม)
 // ==============================================
 
 function toggleMainSection(sectionId) { 
@@ -89,7 +935,7 @@ function toggleSection(sectionId) {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการ Modal
+// ฟังก์ชันจัดการ Modal (คงเดิม)
 // ==============================================
 
 function openSummaryModal(htmlContent) {
@@ -146,7 +992,7 @@ function closeDateRangeExportModal() {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการ Summary Modal
+// ฟังก์ชันจัดการ Summary Modal (คงเดิม)
 // ==============================================
 
 function setupSummaryControlsAndSave() {
@@ -179,7 +1025,7 @@ function setupSummaryControlsAndSave() {
     fsSlider.removeEventListener("input", updateFontSize);
     fsSlider.addEventListener("input", updateFontSize);
 
-    // --- Line Height Controls ---
+// --- Line Height Controls ---
     const lhSlider = document.getElementById("summaryLineHeightSlider");
     const lhValueSpan = document.getElementById("summaryLineHeightValue");
 
@@ -244,20 +1090,48 @@ function setupSummaryControlsAndSave() {
     updateFontSize();
     updateLineHeight();
 }
-
 // ==============================================
-// ฟังก์ชันจัดการบัญชี
+// ฟังก์ชันช่วยลบข้อมูลออกจาก Firebase (เพิ่มใหม่)
+// ==============================================
+async function deleteAccountFromFirebase(targetAccountName) {
+    if (!currentUser) return;
+    
+    const SHARED_ID = 'my_shared_group_01'; // ต้องตรงกับ ID ในฟังก์ชัน load/save
+    const docId = `${SHARED_ID}_${targetAccountName}`;
+    
+    try {
+        await db.collection('users').doc(docId).delete();
+        console.log(`🔥 ลบไฟล์บัญชี ${targetAccountName} บน Server สำเร็จ`);
+    } catch (error) {
+        console.error("Error deleting document:", error);
+        showToast(`❌ ลบข้อมูลบน Server ไม่สำเร็จ: ${error.message}`, 'error');
+    }
+}
+// ==============================================
+// ฟังก์ชันจัดการบัญชี (ปรับปรุงให้บันทึกไป Firebase ด้วย)
 // ==============================================
 
-function addAccount() { 
+async function addAccount() { 
     const accountName = prompt("กรุณากรอกชื่อบัญชีใหม่:");
     if (accountName && !accounts.includes(accountName)) { 
         accounts.push(accountName); 
         updateAccountSelect(); 
         updateMultiAccountSelector(); 
         
+        // --- แก้ไข: บันทึกแบบรอผล ---
         saveToLocal();
-        showToast(`✓ เพิ่มบัญชี "${accountName}" สำเร็จ`, 'success');
+        if (currentUser) {
+            showToast('⏳ กำลังสร้างบัญชีใหม่บน Server...', 'info');
+            try {
+                await saveToFirebase();
+                showToast(`✓ สร้างบัญชี "${accountName}" บน Server สำเร็จ`, 'success');
+            } catch (error) {
+                showToast(`❌ สร้างบัญชีออนไลน์ไม่สำเร็จ (แต่บันทึกในเครื่องแล้ว)`, 'warning');
+            }
+        } else {
+            showToast(`✓ เพิ่มบัญชี "${accountName}" สำเร็จ`, 'success');
+        }
+        // -------------------------
     } else { 
         showToast("❌ ชื่อบัญชีซ้ำหรือกรอกข้อมูลไม่ถูกต้อง", 'error'); 
     } 
@@ -294,10 +1168,16 @@ function changeAccount() {
         const accountRecords = records.filter(record => record.account === currentAccount);
         console.log(`Loaded ${accountRecords.length} records for account: ${currentAccount}`);
         showToast(`📂 โหลดข้อมูลบัญชี "${currentAccount}" สำเร็จ (${accountRecords.length} รายการ)`, 'success');
+        
+    }
+    
+    // บันทึกสถานะว่าเราเลือกบัญชีนี้ล่าสุด (Optional)
+    if (currentUser) {
+        saveToFirebase(); // ไม่จำเป็นต้องเรียก save ทันทีก็ได้ เพื่อลด Traffic
     }
 }
 
-function editAccount() { 
+async function editAccount() { 
     if (!currentAccount) { 
         showToast("❌ กรุณาเลือกบัญชีที่ต้องการแก้ไข", 'error'); 
         return; 
@@ -309,7 +1189,15 @@ function editAccount() {
     if (newAccountName && newAccountName !== currentAccount && !accounts.includes(newAccountName)) { 
         const oldAccountName = currentAccount; 
         
-        // 2. อัปเดตข้อมูล Local
+        // --- ส่วนที่เพิ่ม: จัดการ Firebase ---
+        if (currentUser) {
+            showToast('⏳ กำลังเปลี่ยนชื่อบัญชีบน Server...', 'info');
+            // 1. ลบไฟล์บัญชีชื่อเก่าออกจาก Firestore
+            await deleteAccountFromFirebase(oldAccountName);
+        }
+        // --------------------------------
+        
+        // 2. อัปเดตข้อมูล Local (ตามโค้ดเดิม)
         const index = accounts.indexOf(oldAccountName); 
         if (index > -1) { 
             accounts[index] = newAccountName; 
@@ -339,8 +1227,12 @@ function editAccount() {
             
             showToast(`✓ แก้ไขชื่อบัญชีเป็น "${newAccountName}" สำเร็จ`, 'success'); 
             
-            // 3. บันทึกข้อมูลใหม่
+            // 3. บันทึกข้อมูลใหม่ (จะสร้างไฟล์ชื่อใหม่บน Server อัตโนมัติ)
+            // เรียก saveToFirebase โดยตรงเพื่อให้มั่นใจว่าซิงค์ทันที
             saveToLocal();
+            if (currentUser) {
+                await saveToFirebase();
+            }
         } 
     } else if (accounts.includes(newAccountName)) {
         showToast("❌ ชื่อบัญชีนี้มีอยู่แล้ว", 'error'); 
@@ -348,15 +1240,21 @@ function editAccount() {
         showToast("❌ ยกเลิกการแก้ไขหรือข้อมูลไม่ถูกต้อง", 'error'); 
     } 
 }
-
-function deleteAccount() { 
+async function deleteAccount() { 
     if (currentAccount) { 
         const confirmDelete = confirm(`คุณแน่ใจว่าจะลบบัญชี "${currentAccount}" และข้อมูลทั้งหมดในบัญชีนี้หรือไม่?`); 
         
         if (confirmDelete) { 
             const accountToDelete = currentAccount; 
             
-            // ลบข้อมูล Local
+            // --- ส่วนที่เพิ่ม: ลบข้อมูลออกจาก Firebase ---
+            if (currentUser) {
+                showToast('⏳ กำลังลบข้อมูลออกจาก Server...', 'info');
+                await deleteAccountFromFirebase(accountToDelete);
+            }
+            // ---------------------------------------
+
+            // ลบข้อมูล Local (ตามโค้ดเดิม)
             const index = accounts.indexOf(accountToDelete); 
             if (index > -1) { 
                 accounts.splice(index, 1); 
@@ -375,16 +1273,18 @@ function deleteAccount() {
             
             showToast(`✓ ลบบัญชี "${accountToDelete}" สำเร็จ`, 'success'); 
             
-            // บันทึกการเปลี่ยนแปลง
+            // บันทึกการเปลี่ยนแปลงของ List บัญชี (Main Doc)
             saveToLocal();
+            if (currentUser) {
+                await saveToFirebase();
+            }
         } 
     } else { 
         showToast("❌ กรุณาเลือกบัญชีที่ต้องการลบ", 'error'); 
     } 
 }
-
 // ==============================================
-// ฟังก์ชันจัดการประเภท
+// ฟังก์ชันจัดการประเภท (คงเดิม)
 // ==============================================
 
 function initializeAccountTypes(accountName) { 
@@ -440,7 +1340,7 @@ function restoreType(inputElement) {
     } 
 }
 
-function addNewType() { 
+async function addNewType() { 
     if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีก่อนเพิ่มประเภท", 'error'); return; } 
     
     initializeAccountTypes(currentAccount); 
@@ -460,8 +1360,15 @@ function addNewType() {
     updateTypeList(); 
     document.getElementById('type').value = trimmedTypeName;
     
+    // --- แก้ไข: บันทึกแบบรอผล ---
     saveToLocal();
-    showToast(`✓ เพิ่มประเภทสำเร็จ`, 'success');
+    if (currentUser) {
+        showToast('⏳ กำลังบันทึกประเภทใหม่...', 'info');
+        await saveToFirebase();
+        showToast(`✓ เพิ่มประเภท "${trimmedTypeName}" บน Server สำเร็จ`, 'success');
+    } else {
+        showToast(`✓ เพิ่มประเภทสำเร็จ`, 'success');
+    }
 }
 
 function editType() { 
@@ -540,7 +1447,7 @@ function closeEditTypeModal() {
 }
 
 // ฟังก์ชันประมวลผลการแก้ไขประเภท
-function processTypeEdit(oldType, oldCategory) {
+async function processTypeEdit(oldType, oldCategory) {
     const newTypeName = document.getElementById('editTypeName').value.trim();
     const newCategory = document.getElementById('editTypeCategory').value;
     
@@ -576,11 +1483,17 @@ function processTypeEdit(oldType, oldCategory) {
         
         closeEditTypeModal();
 
+        // --- แก้ไข: บันทึกแบบรอผล ---
         saveToLocal();
-        showToast(`✓ แก้ไขประเภทสำเร็จ`, 'success');
+        if (currentUser) {
+            showToast('⏳ กำลังอัปเดตประเภทบน Server...', 'info');
+            await saveToFirebase();
+            showToast(`✓ แก้ไขประเภทสำเร็จและซิงค์แล้ว`, 'success');
+        } else {
+            showToast(`✓ แก้ไขประเภทสำเร็จ`, 'success');
+        }
     }
 }
-
 // ฟังก์ชันอัพเดทประเภทในข้อมูลที่บันทึกไว้
 function updateRecordsType(oldType, newType, newCategory) {
     let updatedCount = 0;
@@ -600,7 +1513,7 @@ function updateRecordsType(oldType, newType, newCategory) {
     }
 }
 
-function deleteType() { 
+async function deleteType() { 
     if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชี", 'error'); return; } 
     
     initializeAccountTypes(currentAccount); 
@@ -634,10 +1547,16 @@ function deleteType() {
     updateTypeList(); 
     typeInput.value = ''; 
     
+    // --- แก้ไข: บันทึกแบบรอผล ---
     saveToLocal();
-    showToast(`✓ ลบประเภทสำเร็จ`, 'success');
+    if (currentUser) {
+        showToast('⏳ กำลังลบประเภทบน Server...', 'info');
+        await saveToFirebase();
+        showToast(`✓ ลบประเภทบน Server สำเร็จ`, 'success');
+    } else {
+        showToast(`✓ ลบประเภทสำเร็จ`, 'success');
+    }
 }
-
 // ฟังก์ชันเสริมสำหรับการจัดการประเภท
 function showTypeManagement() {
     if (!currentAccount) {
@@ -702,7 +1621,7 @@ function quickEditType(category, typeName) {
     showEditTypeModal(typeName, category);
 }
 
-function quickAddType(category) {
+async function quickAddType(category) {
     const typeName = prompt(`กรุณากรอกชื่อประเภท${category}:`);
     if (!typeName || typeName.trim() === '') return;
     
@@ -718,12 +1637,17 @@ function quickAddType(category) {
     types[category].push(trimmedTypeName);
     updateTypeList();
     
+    // --- Async Save ---
     saveToLocal();
+    if (currentUser) {
+        await saveToFirebase();
+    }
     showToast(`✓ เพิ่มประเภทสำเร็จ`, 'success');
     showTypeManagement(); // รีเฟรช modal
 }
 
-function quickDeleteType(category, typeName) {
+async function quickDeleteType(category, typeName) {
+    // ... (logic ตรวจสอบเดิม) ...
     const recordsToDelete = records.filter(record => record.account === currentAccount && record.type === typeName);
     let confirmMessage = recordsToDelete.length > 0 ? 
         `ลบประเภท "${typeName}" และ ${recordsToDelete.length} รายการที่เกี่ยวข้อง?` : 
@@ -740,12 +1664,16 @@ function quickDeleteType(category, typeName) {
         types[category].splice(index, 1);
         updateTypeList();
         
+        // --- Async Save ---
         saveToLocal();
-        showToast('✓ ลบเรียบร้อย', 'success');
+        if (currentUser) {
+            showToast('⏳ กำลังอัปเดต Server...', 'info');
+            await saveToFirebase();
+            showToast('✓ ลบเรียบร้อย', 'success');
+        }
         showTypeManagement();
     }
 }
-
 // ฟังก์ชันลบข้อมูลที่บันทึกไว้ตามประเภท
 function deleteRecordsByType(typeToDelete) {
     let deletedCount = 0;
@@ -773,134 +1701,13 @@ function deleteRecordsByType(typeToDelete) {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการรายการ
+// ฟังก์ชันจัดการรายการ (ปรับปรุงให้บันทึกไป Firebase ด้วย)
 // ==============================================
-
-function addEntry() {
-    let entryDateInput = document.getElementById('entryDate').value;
-    let entryTimeInput = document.getElementById('entryTime').value;
-    const typeInput = document.getElementById('type');
-    const typeText = typeInput.value.trim();
-    const description = document.getElementById('description').value;
-    const amount = parseFloat(document.getElementById('amount').value);
-    let datePart, timePart;
-    
-    // ตั้งค่าวันเวลา
-    if (!entryDateInput || !entryTimeInput) {
-        const now = new Date();
-        const y = now.getFullYear();
-        const m = String(now.getMonth() + 1).padStart(2, '0');
-        const d = String(now.getDate()).padStart(2, '0');
-        datePart = !entryDateInput ? `${y}-${m}-${d}` : entryDateInput;
-        const hh = String(now.getHours()).padStart(2, '0');
-        const mm = String(now.getMinutes()).padStart(2, '0');
-        timePart = !entryTimeInput ? `${hh}:${mm}` : entryTimeInput;
-    } else {
-        datePart = entryDateInput;
-        timePart = entryTimeInput;
-    }
-    
-    const dateTime = `${datePart} ${timePart}`;
-    
-    // Validation Checks
-    if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีก่อนเพิ่มรายการ", 'error'); return; }
-    if (!typeText) { showToast("❌ กรุณากรอกประเภท", 'error'); return; }
-    if (!description) { showToast("❌ กรุณากรอกรายละเอียด", 'error'); return; }
-    if (isNaN(amount) || amount <= 0) { showToast("❌ กรุณากรอกจำนวนเงินที่ถูกต้อง", 'error'); return; }
-    
-    initializeAccountTypes(currentAccount);
-    const types = accountTypes.get(currentAccount);
-    let entryCategory = 'expense';
-    if (types["รายรับ"].includes(typeText)) {
-        entryCategory = 'income';
-    }
-
-    const userEmail = getCurrentUserIdentifier();
-    const timestamp = new Date().toISOString();
-    
-    if (editingIndex !== null) {
-        // === กรณีแก้ไข (Edit) ===
-        const originalRecord = JSON.parse(JSON.stringify(records[editingIndex]));
-        
-        // สร้าง Object ข้อมูลใหม่
-        const updatedRecord = { 
-            dateTime, 
-            type: typeText, 
-            description, 
-            amount, 
-            account: currentAccount,
-            // คงค่าเดิมที่สำคัญไว้
-            createdBy: originalRecord.createdBy || 'Unknown', 
-            createdTime: originalRecord.createdTime || timestamp, 
-            // อัปเดตข้อมูลผู้แก้ไข
-            editedBy: userEmail,
-            editedTime: timestamp
-        };
-
-        // 1. อัปเดต Local
-        records[editingIndex] = updatedRecord;
-        editingIndex = null;
-        
-        showToast(`✓ แก้ไขข้อมูลเรียบร้อย`, 'info');
-
-    } else {
-        // === กรณีสร้างใหม่ (New) ===
-        const newRecord = { 
-            dateTime, 
-            type: typeText, 
-            description, 
-            amount, 
-            account: currentAccount,
-            createdBy: userEmail,
-            createdTime: timestamp,
-            editedBy: null,
-            editedTime: null
-        };
-        
-        // 1. อัปเดต Local
-        records.push(newRecord);
-
-        // Multi-account check (เพิ่มหลายบัญชี)
-        const selectedCheckboxes = document.querySelectorAll('#multiAccountCheckboxes input:checked');
-        selectedCheckboxes.forEach(checkbox => {
-            const targetAccount = checkbox.value;
-            const clonedRecord = JSON.parse(JSON.stringify(newRecord));
-            clonedRecord.account = targetAccount; // เปลี่ยนชื่อบัญชี
-            
-            // เพิ่มลง Local
-            records.push(clonedRecord);
-        });
-        
-        showToast(`✓ เพิ่มข้อมูลในเครื่องแล้ว`, 'info');
-    }
-    
-    // อัปเดตหน้าจอทันที
-    displayRecords();
-    
-    // เคลียร์ค่า Input
-    document.getElementById('description').value = '';
-    document.getElementById('amount').value = '';
-    setCurrentDateTime();
-    typeInput.value = '';
-    document.querySelectorAll('#multiAccountCheckboxes input:checked').forEach(checkbox => {
-        checkbox.checked = false;
-    });
-    updateMultiAccountSelector();
-
-    // บันทึก LocalStorage (Backup)
-    saveToLocal(); 
-    
-    if (entryCategory === 'income') {
-        showToast('✅ บันทึกรายรับสำเร็จ', 'success');
-    } else {
-        showToast('✅ บันทึกรายจ่ายสำเร็จ', 'success');
-    }
-}
 
 function displayRecords() { 
     const recordBody = document.getElementById('recordBody'); 
     
-    // ปรับปรุงส่วนหัวตารางให้สวยงามมีเส้นขอบ
+    // --- แก้ไข: ปรับปรุงส่วนหัวตารางให้สวยงามมีเส้นขอบ ---
     const theadRow = document.querySelector('#recordTable thead tr');
     if (theadRow && theadRow.children.length === 6) {
         const thUser = document.createElement('th');
@@ -926,6 +1733,7 @@ function displayRecords() {
             <th style="padding: 8px; border: 1px solid #ddd; text-align: center;">🔧 การจัดการ</th>
          `;
     }
+    // ----------------------------------------------------
 
     recordBody.innerHTML = ""; 
     const filteredRecords = records.filter(record => record.account === currentAccount) 
@@ -935,7 +1743,8 @@ function displayRecords() {
         const originalIndex = records.findIndex(r => r === record); 
         const { formattedDate, formattedTime } = formatDateForDisplay(record.dateTime);
         
-        // สร้างข้อความแสดง Audit Trail
+        // สร้างข้อความแสดง Audit Trail (ตรวจสอบว่ามีข้อมูลหรือไม่)
+        // ถ้าเป็นข้อมูลเก่า record.createdBy จะไม่มีค่า จึงแสดงเป็น '-'
         let auditInfo = `<span style="font-size: 11px; color: #666;">สร้าง: ${record.createdBy || '-'}</span>`;
         
         if (record.editedBy) {
@@ -965,7 +1774,6 @@ function displayRecords() {
         recordBody.appendChild(row); 
     } 
 }
-
 function editRecord(index) {
     const record = records[index];
     document.getElementById('type').value = record.type;
@@ -979,7 +1787,10 @@ function editRecord(index) {
     showToast("📝 กำลังแก้ไขรายการ...", 'info');
 }
 
-function deleteRecord(index) { 
+// ==============================================
+// ⭐ deleteRecord() เวอร์ชัน Real-time (แก้ไขใหม่)
+// ==============================================
+async function deleteRecord(index) { 
     if (!confirm('ยืนยันลบรายการนี้?')) return;
 
     const record = records[index];
@@ -987,10 +1798,9 @@ function deleteRecord(index) {
     // ลบจาก UI ทันที
     records.splice(index, 1);
     displayRecords();
-    
-    // บันทึก Local
-    saveToLocal();
-    showToast('🗑️ ลบข้อมูลสำเร็จ', 'success');
+
+    // ลบบน Server (Real-time)
+    await deleteRecordRealtime(record);
 }
 
 function toggleRecordsVisibility() { 
@@ -1004,7 +1814,10 @@ function toggleRecordsVisibility() {
     } 
 }
 
-function deleteRecordsByDate() {
+// ==============================================
+// แก้ไขฟังก์ชัน deleteRecordsByDate ให้ลบออนไลน์ทันที
+// ==============================================
+async function deleteRecordsByDate() {
     const dateInput = document.getElementById('deleteByDateInput');
     const selectedDate = dateInput.value;
     if (!currentAccount) { showToast("❌ กรุณาเลือกบัญชีที่ต้องการลบข้อมูลก่อน", 'error'); return; }
@@ -1035,12 +1848,23 @@ function deleteRecordsByDate() {
 
         // 3. บันทึก
         saveToLocal();
-        showToast(`✓ ลบข้อมูลสำเร็จ`, 'success');
+        
+        if (currentUser) {
+            showToast(`🗑️ กำลังลบข้อมูล ${recordsToDelete.length} รายการ บน Server...`, 'info');
+            try {
+                // บังคับรอ
+                await saveToFirebase();
+                showToast(`✅ ลบข้อมูลวันที่ ${selectedDate} บน Server สำเร็จ`, 'success');
+            } catch (error) {
+                showToast(`❌ ลบออนไลน์ขัดข้อง`, 'error');
+            }
+        } else {
+            showToast(`✓ ลบข้อมูลสำเร็จ`, 'success');
+        }
     }
 }
-
 // ==============================================
-// ฟังก์ชันจัดการบัญชีหลายบัญชี
+// ฟังก์ชันจัดการบัญชีหลายบัญชี (คงเดิม)
 // ==============================================
 
 function updateMultiAccountSelector() { 
@@ -1071,7 +1895,7 @@ function updateMultiAccountSelector() {
 }
 
 // ==============================================
-// ฟังก์ชันนำเข้าข้อมูลจากบัญชีอื่น
+// ฟังก์ชันนำเข้าข้อมูลจากบัญชีอื่น (คงเดิม)
 // ==============================================
 
 function updateImportAccountSelect() {
@@ -1097,7 +1921,8 @@ function updateImportAccountSelect() {
     }
 }
 
-function importEntriesFromAccount() {
+// แก้ไขให้เป็น Async เพื่อรอการบันทึกออนไลน์
+async function importEntriesFromAccount() {
     const sourceAccount = document.getElementById('importAccountSelect').value;
     const importDateStr = document.getElementById('importDate').value;
 
@@ -1147,13 +1972,24 @@ function importEntriesFromAccount() {
         });
         
         displayRecords();
-        saveToLocal();
+        saveToLocal(); // บันทึกเข้าเครื่องก่อน
+        
+        // --- ส่วนที่เพิ่มใหม่: บังคับซิงค์ออนไลน์ทันที ---
+        if (currentUser) {
+            showToast('☁️ กำลังอัปเดตข้อมูลออนไลน์...', 'info');
+            try {
+                await saveToFirebase(); // รอจนกว่าจะบันทึกเสร็จ
+            } catch (err) {
+                console.error("Auto-sync failed:", err);
+            }
+        }
+        // ------------------------------------------
+
         showToast(`✓ คัดลอกข้อมูลสำเร็จ! เพิ่ม ${importedCount} รายการใหม่, ข้าม ${skippedCount} รายการที่ซ้ำซ้อน`, 'success');
     }
 }
-
 // ==============================================
-// ฟังก์ชันจัดการข้อมูลสรุป
+// ฟังก์ชันจัดการข้อมูลสรุป (คงเดิม)
 // ==============================================
 
 function parseDateInput(dateStr) {
@@ -1165,7 +2001,7 @@ function parseDateInput(dateStr) {
 }
 
 // ==============================================
-// ฟังก์ชันเสริมสำหรับจัดการ Time Zone
+// ฟังก์ชันเสริมสำหรับจัดการ Time Zone (คงเดิม)
 // ==============================================
 
 function parseLocalDateTime(dateTimeStr) {
@@ -1736,7 +2572,7 @@ function summarizeAll() {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการการส่งออกข้อมูล
+// ฟังก์ชันจัดการการส่งออกข้อมูล (ปรับปรุงให้แสดงข้อมูล Audit Trail)
 // ==============================================
 
 function saveToFile() { 
@@ -1898,12 +2734,17 @@ async function exportDateRangeAsJson(filteredRecords, startDate, endDate) {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการไฟล์ (บันทึก/โหลด)
+// ฟังก์ชันจัดการไฟล์ (บันทึก/โหลด) - ปรับปรุง
 // ==============================================
 
 function saveDataAndShowToast(entryCategory = 'neutral') { 
     // บันทึกไปยัง localStorage เสมอ
     saveToLocal();
+    
+    // บันทึกไปยัง Firebase ถ้ามีผู้ใช้ล็อกอิน
+    if (currentUser) {
+        saveToFirebase();
+    }
     
     // ใช้ฟังก์ชัน showToast แทนการจัดการ toast โดยตรง
     let message = '✓ บันทึกข้อมูลสำเร็จแล้ว';
@@ -1930,7 +2771,7 @@ function saveToLocal(fromPasswordSave = false) {
     };
     try {
         localStorage.setItem('accountData', JSON.stringify(dataToSave));
-        if (!fromPasswordSave) {
+        if (!fromPasswordSave && !currentUser) {
             showToast('✓ บันทึกข้อมูลชั่วคราวในเบราว์เซอร์เรียบร้อยแล้ว', 'success');
         }
     } catch (error) {
@@ -1956,10 +2797,14 @@ function loadFromLocal() {
             }
             changeAccount();
             
-            showToast('📂 โหลดข้อมูลจากเครื่องสำเร็จ', 'success');
+            if (!currentUser) {
+                showToast('📂 โหลดข้อมูลจากเครื่องสำเร็จ', 'success');
+            }
         } catch (error) {
             console.error("โหลดข้อมูลจาก LocalStorage ไม่สำเร็จ", error);
-            showToast('❌ โหลดข้อมูลจากเครื่องไม่สำเร็จ', 'error');
+            if (!currentUser) {
+                showToast('❌ โหลดข้อมูลจากเครื่องไม่สำเร็จ', 'error');
+            }
         }
     }
     updateMultiAccountSelector();
@@ -2211,7 +3056,7 @@ async function handleSingleDateExportAs(format) {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการการนำเข้าไฟล์
+// ฟังก์ชันจัดการการนำเข้าไฟล์ (คงเดิม)
 // ==============================================
 
 async function loadFromFile(event) {
@@ -2325,7 +3170,7 @@ async function loadFromFile(event) {
 async function processDateRangeImport(importedData) {
     const { accountName, exportStartDate, exportEndDate, records: recordsToAdd, accountTypes: importedAccountTypes } = importedData;
     
-    // Logic ในการ Merge Records
+    // ... (Logic เดิมในการ Merge Records) ...
     if (!accounts.includes(accountName)) { accounts.push(accountName); }
     if (importedAccountTypes) { accountTypes.set(accountName, importedAccountTypes); }
     else { initializeAccountTypes(accountName); }
@@ -2334,7 +3179,7 @@ async function processDateRangeImport(importedData) {
     let skippedCount = 0;
     
     recordsToAdd.forEach(recordToAdd => {
-        // Logic เช็คซ้ำเดิม
+        // ... (Logic เช็คซ้ำเดิม) ...
         const isDuplicate = records.some(existingRecord =>
             existingRecord.account === accountName &&
             existingRecord.dateTime === recordToAdd.dateTime &&
@@ -2355,8 +3200,19 @@ async function processDateRangeImport(importedData) {
     document.getElementById('accountSelect').value = currentAccount;
     changeAccount();
     
+    // --- แก้ไข: บันทึกแบบรอผล (สำคัญมากสำหรับการ Import) ---
     saveToLocal();
-    showToast(`✅ เติมข้อมูลสำเร็จ! (${addedCount} รายการ)`, 'success');
+    if (currentUser) {
+        showToast(`⏳ นำเข้าสำเร็จ ${addedCount} รายการ.. กำลังอัปโหลด...`, 'info');
+        try {
+            await saveToFirebase();
+            showToast(`✅ อัปโหลดข้อมูลนำเข้าขึ้น Server เรียบร้อย`, 'success');
+        } catch (error) {
+            showToast(`⚠️ นำเข้าลงเครื่องแล้ว แต่อัปโหลดไม่สำเร็จ`, 'warning');
+        }
+    } else {
+        showToast(`✅ เติมข้อมูลสำเร็จ! (${addedCount} รายการ)`, 'success');
+    }
 }
 
 function createImportConfirmationMessage(accountName, startDate, endDate, recordCount) {
@@ -2420,6 +3276,7 @@ function importFromFileForMerging(event) {
     const reader = new FileReader();
     const fileName = file.name.toLowerCase();
 
+    // เปลี่ยนเป็น Async เพื่อรองรับการรอ saveToFirebase
     const processAndMerge = async (dataString) => {
         try {
             let parsedData = JSON.parse(dataString);
@@ -2467,7 +3324,18 @@ function importFromFileForMerging(event) {
                 });
 
                 displayRecords();
-                saveToLocal();
+                saveToLocal(); // บันทึกเข้าเครื่อง
+                
+                // --- ส่วนที่เพิ่มใหม่: บังคับซิงค์ออนไลน์ทันที ---
+                if (currentUser) {
+                    showToast('☁️ กำลังอัปเดตข้อมูลออนไลน์...', 'info');
+                    try {
+                        await saveToFirebase(); // รอจนกว่าจะบันทึกเสร็จ
+                    } catch (err) {
+                        console.error("Auto-sync failed:", err);
+                    }
+                }
+                // ------------------------------------------
 
                 showToast(`✅ เติมข้อมูลสำเร็จ!\nเพิ่ม ${addedCount} รายการใหม่\nข้าม ${skippedCount} รายการที่ซ้ำซ้อน`, 'success');
 
@@ -2490,7 +3358,6 @@ function importFromFileForMerging(event) {
     reader.onerror = () => showToast("❌ เกิดข้อผิดพลาดในการอ่านไฟล์", 'error');
     event.target.value = '';
 }
-
 function loadFromCsv(csvText) {
     let csvImportData = { 
         isFullBackup: false, 
@@ -2510,6 +3377,7 @@ function loadFromCsv(csvText) {
     Papa.parse(csvText, {
         skipEmptyLines: true,
         step: function(results) {
+            // ... (ส่วน Step เหมือนเดิม ไม่ต้องแก้) ...
             const row = results.data;
             const firstCell = (row[0] || '').trim();
             
@@ -2568,11 +3436,12 @@ function loadFromCsv(csvText) {
                 }
             }
         },
-        complete: async function() {
+        complete: async function() { // ✅ เพิ่ม async เพื่อรองรับการรอ Save
             if (csvImportData.isFullBackup) {
                 // กรณี CSV แบบ Backup ทั้งหมด
                  if(confirm("ไฟล์นี้เป็นไฟล์ CSV Backup ทั้งหมด ต้องการโหลดทับหรือไม่?")) {
-                    // Logic การโหลด Full Backup CSV
+                    // Logic การโหลด Full Backup CSV (ต้อง Implement ตามโครงสร้างข้อมูลของคุณ)
+                    // เนื่องจาก CSV อาจเก็บข้อมูลโครงสร้างไม่ครบเท่า JSON แนะนำให้ใช้ JSON สำหรับ Full Backup จะดีกว่า
                     showToast('⚠️ แนะนำให้ใช้ไฟล์ JSON สำหรับการกู้คืนข้อมูลทั้งหมด', 'warning');
                  }
             } else if (csvImportData.isDailyExport) {
@@ -2582,13 +3451,14 @@ function loadFromCsv(csvText) {
                  if (confirm(confirmMsg)) {
                      processDateRangeImport({
                         accountName: accountName,
+                        // วันที่อาจต้องปรับจูนตามข้อมูลจริง
                         exportStartDate: exportDate, 
                         exportEndDate: exportDate,
                         records: recordsToAdd
                     });
                  }
             } else if (csvImportData.isDateRangeExport) {
-                 // กรณี CSV ช่วงวันที่
+                 // กรณี CSV ช่วงวันที่ (ที่คุณเพิ่มมา)
                 const { accountName, exportStartDate, exportEndDate, records: recordsToAdd } = csvImportData;
                 const confirmMsg = `ไฟล์ CSV นี้นำเข้าข้อมูลช่วงวันที่ ${exportStartDate} ถึง ${exportEndDate} จำนวน ${recordsToAdd.length} รายการ\n\nกด OK เพื่อเพิ่มรายการ`;
                 
@@ -2601,7 +3471,7 @@ function loadFromCsv(csvText) {
                     });
                 }
             } else if (csvImportData.accountName) {
-                // กรณี CSV บัญชีเดียว
+                // กรณี CSV บัญชีเดียว (Single Account)
                  const confirmMsg = `ไฟล์ CSV นี้เป็นข้อมูลบัญชี "${csvImportData.accountName}"\nกด OK เพื่อ "แทนที่" ข้อมูลบัญชีนี้ทั้งหมด`;
                  if (confirm(confirmMsg)) {
                     if (!accounts.includes(csvImportData.accountName)) {
@@ -2622,7 +3492,12 @@ function loadFromCsv(csvText) {
                     document.getElementById('accountSelect').value = currentAccount;
                     changeAccount();
                     
+                    // ✅ บันทึกข้อมูลและบังคับซิงค์
                     saveToLocal();
+                    if (currentUser) {
+                        showToast('☁️ กำลังอัปเดตข้อมูลออนไลน์...', 'info');
+                        await saveToFirebase();
+                    }
                     showToast(`✅ นำเข้าข้อมูล CSV บัญชี "${csvImportData.accountName}" สำเร็จ`, 'success');
                  }
             } else {
@@ -2631,9 +3506,8 @@ function loadFromCsv(csvText) {
         }
     });
 }
-
 // ==============================================
-// ฟังก์ชันจัดการรหัสผ่าน
+// ฟังก์ชันจัดการรหัสผ่าน (คงเดิม)
 // ==============================================
 
 async function saveBackupPassword(e) {
@@ -2646,9 +3520,16 @@ async function saveBackupPassword(e) {
     }
     backupPassword = newPassword.trim() || null;
     
+    // --- แก้ไข: บันทึกแบบรอผล ---
     saveToLocal();
-    renderBackupPasswordStatus();
-    showToast('✅ บันทึกรหัสผ่านในเครื่องเรียบร้อย', 'success');
+    if (currentUser) {
+        showToast('⏳ กำลังบันทึกรหัสผ่านไปยัง Server...', 'info');
+        await saveToFirebase(); // รอให้ตั้งค่ารหัสผ่านบน Cloud เสร็จ
+        showToast('✅ ตั้งค่ารหัสผ่านบน Server เรียบร้อย', 'success');
+    } else {
+        renderBackupPasswordStatus();
+        showToast('✅ บันทึกรหัสผ่านในเครื่องเรียบร้อย', 'success');
+    }
     
     document.getElementById('backup-password').value = '';
     document.getElementById('backup-password-confirm').value = '';
@@ -2667,7 +3548,7 @@ function renderBackupPasswordStatus() {
 }
 
 // ==============================================
-// ฟังก์ชันการเข้ารหัส
+// ฟังก์ชันการเข้ารหัส (คงเดิม)
 // ==============================================
 
 function arrayBufferToBase64(buffer) { 
@@ -2744,7 +3625,7 @@ async function decryptData(encryptedPayload, password) {
 }
 
 // ==============================================
-// ฟังก์ชันส่งออก Summary เป็น XLSX
+// ฟังก์ชันส่งออก Summary เป็น XLSX (คงเดิม)
 // ==============================================
 
 function exportSummaryToXlsx(summaryResult, title, dateString, remark, transactionDaysInfo = null, periodName, daysDiff = 0, activeDays = 0) {
@@ -2906,7 +3787,7 @@ function applyExcelStyles(ws, data) {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการ PWA
+// ฟังก์ชันจัดการ PWA (คงเดิม)
 // ==============================================
 
 function hideInstallPrompt() { 
@@ -2917,7 +3798,7 @@ function hideInstallPrompt() {
 }
 
 // ==============================================
-// ฟังก์ชันเสริมสำหรับการส่งออกตามช่วงวันที่
+// ฟังก์ชันเสริมสำหรับการส่งออกตามช่วงวันที่ (คงเดิม)
 // ==============================================
 
 function validateDateRangeInput() {
@@ -2958,7 +3839,7 @@ function showNoDataAlert(startDateStr, endDateStr) {
 }
 
 // ==============================================
-// ฟังก์ชันตั้งค่าวันที่และเวลาปัจจุบัน
+// ฟังก์ชันตั้งค่าวันที่และเวลาปัจจุบัน (คงเดิม)
 // ==============================================
 
 function setCurrentDateTime() {
@@ -2977,7 +3858,7 @@ function setCurrentDateTime() {
 }
 
 // ==============================================
-// ฟังก์ชันจัดการปุ่ม Enter ในฟอร์มเพิ่มข้อมูล
+// ฟังก์ชันจัดการปุ่ม Enter ในฟอร์มเพิ่มข้อมูล (คงเดิม)
 // ==============================================
 
 function setupEnterKeyForAddEntry() {
@@ -3009,86 +3890,123 @@ function setupEnterKeyForAddEntry() {
         }
     });
 }
-
 // ==============================================
-// ฟังก์ชันจัดการ Toast Notification
+// ฟังก์ชันเปลี่ยนรหัสผ่าน Firebase (Version 2: ยืนยันรหัสเดิม + ดูรหัสได้)
 // ==============================================
 
-function showToast(message, type = 'info') {
-    const toast = document.getElementById('toast');
-    
-    // กำหนดสีตามประเภท
-    let backgroundColor = '#007bff'; // เริ่มต้นสีน้ำเงิน
-    switch(type) {
-        case 'success':
-            backgroundColor = '#28a745'; // สีเขียว
-            break;
-        case 'error':
-            backgroundColor = '#dc3545'; // สีแดง
-            break;
-        case 'warning':
-            backgroundColor = '#ffc107'; // สีเหลือง
-            break;
-        case 'income':
-            backgroundColor = '#28a745'; // สีเขียวสำหรับรายรับ
-            break;
-        case 'expense':
-            backgroundColor = '#dc3545'; // สีแดงสำหรับรายจ่าย
-            break;
-        case 'info':
-        default:
-            backgroundColor = '#007bff'; // สีน้ำเงิน
-            break;
+function openChangePasswordModal() {
+    if (!currentUser) {
+        showToast("❌ คุณยังไม่ได้เข้าสู่ระบบ", 'error');
+        return;
     }
+    // เคลียร์ค่าเก่าก่อนเปิด
+    document.getElementById('oldFirebasePassword').value = '';
+    document.getElementById('newFirebasePassword').value = '';
+    document.getElementById('confirmFirebasePassword').value = '';
     
-    // ตั้งค่าข้อความและสี
-    toast.textContent = message;
-    toast.style.backgroundColor = backgroundColor;
+    // รีเซ็ตให้เป็น type password ทั้งหมด (กรณีเปิดค้างไว้แบบ text)
+    ['oldFirebasePassword', 'newFirebasePassword', 'confirmFirebasePassword'].forEach(id => {
+        document.getElementById(id).type = 'password';
+    });
     
-    // แสดง toast
-    toast.className = "toast-notification show";
-    
-    // ซ่อน toast หลังจาก 3 วินาที
-    setTimeout(function() {
-        toast.className = toast.className.replace("show", "");
-    }, 3000);
+    document.getElementById('changePasswordModal').style.display = 'flex';
 }
 
-// ==============================================
-// ฟังก์ชัน Sync Status Bar (สำหรับ Offline Mode)
-// ==============================================
-
-function updateSyncStatus() {
-    const syncStatus = document.getElementById('sync-status');
-    if (!syncStatus) return;
-    
-    syncStatus.textContent = '💾 โหมดออฟไลน์ 100% (บันทึกในเครื่อง)';
-    syncStatus.style.color = '#4CAF50';
+function closeChangePasswordModal() {
+    document.getElementById('changePasswordModal').style.display = 'none';
 }
 
+// ฟังก์ชันสำหรับกดรูปตา 👁️ เพื่อดูรหัสผ่าน
+function toggleInputPassword(inputId) {
+    const input = document.getElementById(inputId);
+    if (input.type === "password") {
+        input.type = "text";
+    } else {
+        input.type = "password";
+    }
+}
+
+async function handleChangePassword() {
+    const oldPass = document.getElementById('oldFirebasePassword').value;
+    const newPass = document.getElementById('newFirebasePassword').value;
+    const confirmPass = document.getElementById('confirmFirebasePassword').value;
+
+    // 1. ตรวจสอบข้อมูลเบื้องต้น
+    if (!oldPass) {
+        showToast("❌ กรุณากรอกรหัสผ่านเดิมเพื่อยืนยันตัวตน", 'warning');
+        return;
+    }
+    if (newPass.length < 6) {
+        showToast("❌ รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร", 'warning');
+        return;
+    }
+    if (newPass !== confirmPass) {
+        showToast("❌ รหัสผ่านใหม่และการยืนยันไม่ตรงกัน", 'error');
+        return;
+    }
+    if (oldPass === newPass) {
+        showToast("❌ รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม", 'warning');
+        return;
+    }
+
+    if (!currentUser) {
+        showToast("❌ ไม่พบผู้ใช้งาน กรุณาล็อกอินใหม่", 'error');
+        closeChangePasswordModal();
+        return;
+    }
+
+    try {
+        showToast("⏳ กำลังตรวจสอบรหัสผ่านเดิม...", 'info');
+
+        // 2. สร้าง Credential จากอีเมลปัจจุบัน + รหัสผ่านเดิมที่กรอกมา
+        const credential = firebase.auth.EmailAuthProvider.credential(currentUser.email, oldPass);
+
+        // 3. สั่ง Re-authenticate (ยืนยันตัวตนซ้ำ)
+        // ขั้นตอนนี้จะช่วยแก้ปัญหา 'auth/requires-recent-login' ได้ด้วย
+        await currentUser.reauthenticateWithCredential(credential);
+
+       showToast("⏳ รหัสเดิมถูกต้อง กำลังเปลี่ยนรหัสผ่าน...", 'info');
+
+        // 4. เมื่อยืนยันผ่านแล้ว จึงสั่งเปลี่ยนรหัสผ่าน
+        await currentUser.updatePassword(newPass);
+        
+        showToast("✅ เปลี่ยนรหัสผ่านสำเร็จ! กรุณาล็อกอินใหม่ด้วยรหัสใหม่", 'success');
+        closeChangePasswordModal();
+
+        // (ทางเลือก) สั่งล็อกเอาท์เพื่อให้ผู้ใช้ลองเข้าใหม่ทันที
+        // await firebase.auth().signOut(); 
+        // location.reload();
+
+    } catch (error) {
+        console.error("Change password error:", error);
+        
+        if (error.code === 'auth/wrong-password') {
+            showToast("❌ รหัสผ่านเดิมไม่ถูกต้อง", 'error');
+        } else if (error.code === 'auth/weak-password') {
+            showToast("❌ รหัสผ่านง่ายเกินไป", 'error');
+        } else if (error.code === 'auth/too-many-requests') {
+            showToast("❌ ทำรายการถี่เกินไป โปรดรอสักครู่", 'error');
+        } else {
+            showToast(`❌ เกิดข้อผิดพลาด: ${error.message}`, 'error');
+        }
+    }
+}
 // ==============================================
-// ฟังก์ชันเริ่มต้น
+// ฟังก์ชันเริ่มต้น (ปรับปรุง)
 // ==============================================
 
 window.onload = function () {
-    // ซ่อนส่วนรายละเอียดเริ่มต้น
     document.getElementById('detailsSection').style.display = 'none';
     
     // ตั้งค่าวันที่และเวลาปัจจุบันเมื่อโหลดหน้าเว็บ
     setCurrentDateTime();
     
-    // ลบ UI Login ที่ไม่จำเป็น
-    document.getElementById('login-overlay')?.remove();
-    document.getElementById('btnLogout')?.remove();
-    
-    // เพิ่ม Event Listener สำหรับ Backup Password
     document.getElementById('backup-password-form').addEventListener('submit', saveBackupPassword);
     document.getElementById('show-backup-password').addEventListener('change', (e) => {
         document.getElementById('backup-password').type = e.target.checked ? 'text' : 'password';
         document.getElementById('backup-password-confirm').type = e.target.checked ? 'text' : 'password';
     });
     
-    // เพิ่ม Event Listener สำหรับปิด Modal เมื่อคลิกข้างนอก
     window.addEventListener('click', (event) => {
         const modal = document.getElementById('summaryModal');
         if (event.target == modal) { 
@@ -3096,7 +4014,6 @@ window.onload = function () {
         }
     });
     
-    // ตรวจสอบ PWA Installation
     if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone || localStorage.getItem('pwa_installed') === 'true') {
         hideInstallPrompt();
     }
@@ -3109,19 +4026,17 @@ window.onload = function () {
     // ตั้งค่าปุ่ม Enter
     setupEnterKeyForAddEntry(); 
     
-    // โหลดข้อมูลจาก LocalStorage
-    loadFromLocal();
-    
-    // อัพเดท Sync Status
-    updateSyncStatus();
-    
-    // เปิดเมนูบัญชีโดยอัตโนมัติ
+    // รอให้ Firebase authentication ทำงานก่อน
     setTimeout(() => {
         toggleMainSection('account-section');
+        
+        // ถ้ายังไม่มีผู้ใช้ล็อกอิน ให้โหลดข้อมูลจาก localStorage
+        if (!currentUser) {
+            loadFromLocal();
+        }
     }, 500);
 };
 
-// Event Listener สำหรับ PWA Installation
 window.addEventListener('appinstalled', () => { 
     console.log('App was installed.'); 
     hideInstallPrompt(); 
